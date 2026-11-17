@@ -32,6 +32,111 @@ static EMITTER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Default loopback TCP endpoint for the local `MuObserve-collector` native `MUOB` Arrow listener.
 pub const DEFAULT_COLLECTOR_MUOB_ADDR: &str = "127.0.0.1:4319";
 
+/// Canonical OpenTelemetry `service_name` emitted by `mu-ci-worker`.
+pub const WORKER_SERVICE_NAME: &str = "mu-ci-worker";
+
+/// Outcome classification for a finalized stage trace span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageSpanOutcome {
+    /// Stage exited cleanly with status `0`.
+    Succeeded,
+    /// User-supplied code, tests, or lints returned a non-zero exit code (e.g., `1`, `101`).
+    UserFailure,
+    /// Stage execution was cancelled via `StageCancelTask` (e.g., exit code `130`).
+    Cancelled,
+    /// Stage execution exceeded its timeout budget (`124`).
+    TimedOut,
+    /// Child process terminated unexpectedly due to an OS signal (`128 + sig`, e.g., `137`).
+    SignalTerminated,
+    /// Worker, sandbox, validation, or tool-spawn infrastructure failure (`-1`, `126`, `127`).
+    InfraFailure,
+}
+
+impl StageSpanOutcome {
+    /// Classifies a stage outcome from its exit code and optional error message.
+    #[must_use]
+    pub fn classify(exit_code: i32, error_message: Option<&str>) -> Self {
+        if exit_code == 0 {
+            return Self::Succeeded;
+        }
+        let is_cancel_msg = error_message.is_some_and(|msg| {
+            msg.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("stage cancelled")
+        });
+        if is_cancel_msg {
+            return Self::Cancelled;
+        }
+        if exit_code == 130 {
+            let is_raw_sigint =
+                error_message.is_some_and(|msg| msg.contains("terminated by signal"));
+            return if is_raw_sigint {
+                Self::SignalTerminated
+            } else {
+                Self::Cancelled
+            };
+        }
+        if exit_code == 124 {
+            return Self::TimedOut;
+        }
+        if exit_code < 0 || exit_code == 126 || exit_code == 127 {
+            return Self::InfraFailure;
+        }
+        if exit_code > 128 {
+            return Self::SignalTerminated;
+        }
+        Self::UserFailure
+    }
+
+    /// Returns the canonical wire label for the span `outcome` attribute.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::UserFailure => "user_failure",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::SignalTerminated => "signal_terminated",
+            Self::InfraFailure => "infra_failure",
+        }
+    }
+
+    /// Returns `"ERROR"` strictly for worker, sandbox, timeout, signal, or exec failures,
+    /// and `"OK"` for normal stage runs (including user lint/test exits and cancellations).
+    #[must_use]
+    pub const fn span_status_code(self) -> &'static str {
+        match self {
+            Self::Succeeded | Self::UserFailure | Self::Cancelled => "OK",
+            Self::TimedOut | Self::SignalTerminated | Self::InfraFailure => "ERROR",
+        }
+    }
+
+    /// Returns `true` when this outcome represents a worker/sandbox/exec infrastructure error.
+    #[must_use]
+    pub const fn is_infra_error(self) -> bool {
+        matches!(
+            self,
+            Self::TimedOut | Self::SignalTerminated | Self::InfraFailure
+        )
+    }
+}
+
+/// Classifies child stage log severity safely without promoting routine `stderr` tool output
+/// or negative-test fixtures inside passing test/coverage stages to daemon `WARN` / `ERROR`.
+#[must_use]
+pub fn classify_stage_log_severity(
+    _stage_id: &str,
+    stream: i8,
+    _line: &str,
+) -> (i32, &'static str, &'static str) {
+    let stream_label = if stream == 2 { "stderr" } else { "stdout" };
+    // Stage stdout/stderr lines belong to the child tool stream (distinguished via
+    // `attributes_json.stream`) rather than worker-daemon diagnostics; keeping child
+    // output at INFO prevents routine cargo/git progress and negative-test fixture
+    // output (e.g., `[k3-worker error]`) from polluting daemon WARN/ERROR telemetry.
+    (9, "INFO", stream_label)
+}
+
 /// Detected or configured hardware execution profile for a stage or benchmark run.
 ///
 /// Follows `AGENTS.md §6` canonical cluster mapping on SpacemiT K3:
@@ -292,6 +397,20 @@ impl StageTraceSession {
     /// Finalizes and returns the [`OtelSpanEntry`] covering sandbox setup, tool execution, and metric parsing.
     #[must_use]
     pub fn finish_span(&self, exit_code: i32, error_message: Option<&str>) -> OtelSpanEntry {
+        let outcome = StageSpanOutcome::classify(exit_code, error_message);
+        self.finish_span_with_outcome(exit_code, outcome, error_message)
+    }
+
+    /// Finalizes and returns the [`OtelSpanEntry`] using an explicit [`StageSpanOutcome`]
+    /// classification so user test/lint failures and cancellations keep `"OK"` span status
+    /// while worker/sandbox/exec failures record `"ERROR"`.
+    #[must_use]
+    pub fn finish_span_with_outcome(
+        &self,
+        exit_code: i32,
+        outcome: StageSpanOutcome,
+        error_message: Option<&str>,
+    ) -> OtelSpanEntry {
         let now_ns = Utc::now()
             .timestamp_nanos_opt()
             .unwrap_or(self.start_time_unix_nano);
@@ -304,32 +423,56 @@ impl StageTraceSession {
             .saturating_add(self.metric_parse_ns);
         let duration_ns = measured_ns.max(phase_sum_ns);
 
-        let status_code = if exit_code == 0 {
-            "OK".to_string()
+        let status_code = outcome.span_status_code().to_string();
+        let status_message = if outcome.is_infra_error() {
+            error_message.map(ToString::to_string)
         } else {
-            "ERROR".to_string()
+            None
         };
 
-        let attrs = serde_json::json!({
-            "job_id": self.job_id,
-            "stage_id": self.stage_id,
-            "repo_name": self.repo_name,
-            "commit_sha": self.commit_sha,
-            "exit_code": exit_code,
-            "arch": self.hardware.arch,
-            "cpu_cluster": self.hardware.cpu_cluster,
-            "vlen_bits": self.hardware.vlen_bits,
-            "sandbox_setup_ns": self.sandbox_setup_ns,
-            "tool_execution_ns": self.tool_execution_ns,
-            "metric_parse_ns": self.metric_parse_ns,
-        });
+        let mut attrs_map = serde_json::Map::new();
+        attrs_map.insert("job_id".into(), serde_json::json!(self.job_id));
+        attrs_map.insert("stage_id".into(), serde_json::json!(self.stage_id));
+        attrs_map.insert("repo_name".into(), serde_json::json!(self.repo_name));
+        attrs_map.insert("commit_sha".into(), serde_json::json!(self.commit_sha));
+        attrs_map.insert("exit_code".into(), serde_json::json!(exit_code));
+        attrs_map.insert("outcome".into(), serde_json::json!(outcome.as_str()));
+        attrs_map.insert(
+            "infra_error".into(),
+            serde_json::json!(outcome.is_infra_error()),
+        );
+        if let Some(msg) = error_message {
+            attrs_map.insert("outcome_message".into(), serde_json::json!(msg));
+        }
+        attrs_map.insert("arch".into(), serde_json::json!(self.hardware.arch));
+        attrs_map.insert(
+            "cpu_cluster".into(),
+            serde_json::json!(self.hardware.cpu_cluster),
+        );
+        attrs_map.insert(
+            "vlen_bits".into(),
+            serde_json::json!(self.hardware.vlen_bits),
+        );
+        attrs_map.insert(
+            "sandbox_setup_ns".into(),
+            serde_json::json!(self.sandbox_setup_ns),
+        );
+        attrs_map.insert(
+            "tool_execution_ns".into(),
+            serde_json::json!(self.tool_execution_ns),
+        );
+        attrs_map.insert(
+            "metric_parse_ns".into(),
+            serde_json::json!(self.metric_parse_ns),
+        );
+        let attrs = serde_json::Value::Object(attrs_map);
 
         let redactor = DeterministicSecretRedactor::new();
         let mut span = OtelSpanEntry {
             trace_id: self.trace_id_hex(),
             span_id: self.span_id_hex(),
             parent_span_id: self.parent_span_id_hex(),
-            service_name: "action-runner-worker".to_string(),
+            service_name: WORKER_SERVICE_NAME.to_string(),
             node_id: self.node_id.clone(),
             span_name: format!("ci.stage.{}", self.stage_id),
             span_kind: "INTERNAL".to_string(),
@@ -339,7 +482,7 @@ impl StageTraceSession {
                 .saturating_add(i64::try_from(duration_ns).unwrap_or(0)),
             duration_ns,
             status_code,
-            status_message: error_message.map(ToString::to_string),
+            status_message,
             attributes_json: attrs.to_string(),
         };
         span.redact_in_place(&redactor);
@@ -358,11 +501,6 @@ impl StageTraceSession {
         let mut next_line_no = 1u32;
 
         for e in entries {
-            let (severity_number, severity_text, stream_label) = if e.stream == 2 {
-                (13, "WARN", "stderr")
-            } else {
-                (9, "INFO", "stdout")
-            };
             let split_lines: Vec<&str> = if e.content.is_empty() {
                 vec![""]
             } else {
@@ -377,6 +515,8 @@ impl StageTraceSession {
             };
 
             for (idx, line) in split_lines.into_iter().enumerate() {
+                let (severity_number, severity_text, stream_label) =
+                    classify_stage_log_severity(&self.stage_id, e.stream, line);
                 let line_no = if start_line_no == 0 {
                     0
                 } else {
@@ -394,7 +534,7 @@ impl StageTraceSession {
                     span_id: span_id.clone(),
                     severity_number,
                     severity_text: severity_text.to_string(),
-                    service_name: "action-runner-worker".to_string(),
+                    service_name: WORKER_SERVICE_NAME.to_string(),
                     node_id: e.node_id.clone(),
                     body: line.to_string(),
                     attributes_json: attrs.to_string(),
@@ -887,6 +1027,7 @@ mod tests {
         assert_eq!(span.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
         assert_eq!(span.parent_span_id.as_deref(), Some("00f067aa0ba902b7"));
         assert_eq!(span.span_id, session.span_id_hex());
+        assert_eq!(span.service_name, "mu-ci-worker");
         assert_eq!(span.status_code, "OK");
         assert!(span.duration_ns >= 27_000_000);
         assert!(span.attributes_json.contains("\"cpu_cluster\":\"X100\""));
@@ -918,12 +1059,126 @@ mod tests {
         for log in &correlated_logs {
             assert_eq!(log.trace_id, span.trace_id);
             assert_eq!(log.span_id, span.span_id);
+            assert_eq!(log.service_name, "mu-ci-worker");
             assert_eq!(log.job_id.as_deref(), Some("job-wave3-33"));
             assert_eq!(log.stage_id.as_deref(), Some("stage-test-rvv"));
         }
         assert!(correlated_logs[0].body.contains("[REDACTED:MUOBSERVE]"));
+        assert_eq!(correlated_logs[0].severity_number, 9);
         assert_eq!(correlated_logs[0].severity_text, "INFO");
-        assert_eq!(correlated_logs[1].severity_text, "WARN");
+        assert_eq!(correlated_logs[1].severity_number, 9);
+        assert_eq!(correlated_logs[1].severity_text, "INFO");
+        let stderr_attrs: serde_json::Value =
+            serde_json::from_str(&correlated_logs[1].attributes_json).unwrap();
+        assert_eq!(stderr_attrs["stream"].as_str(), Some("stderr"));
+    }
+
+    #[test]
+    fn test_correlate_logs_classifies_routine_stderr_and_negative_test_fixtures_as_info() {
+        let cfg = sample_worker_config("riscv64", &["riscv64", "k3"]);
+        let mut task = sample_dispatch_task(
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            false,
+        );
+        task.stage_id = "coverage-check".to_string();
+        let hw = HardwareProfile::detect(&cfg, &task, None);
+        let session = StageTraceSession::from_dispatch_task(&task, &cfg.node_id, &hw);
+
+        let entries = vec![
+            LogEntry {
+                timestamp_us: 1_700_000_000_000_000,
+                job_id: task.job_id.clone(),
+                stage_id: task.stage_id.clone(),
+                node_id: cfg.node_id.clone(),
+                stream: 2,
+                line_no: 1,
+                content: "   Compiling mu-ci-worker v0.2.0\n     Running unittests src/lib.rs\nCloning into '/tmp/stage'...".to_string(),
+            },
+            LogEntry {
+                timestamp_us: 1_700_000_000_001_000,
+                job_id: task.job_id.clone(),
+                stage_id: task.stage_id.clone(),
+                node_id: cfg.node_id.clone(),
+                stream: 2,
+                line_no: 4,
+                content: "[k3-worker error] simulated negative test fixture failure".to_string(),
+            },
+        ];
+
+        let correlated = session.correlate_logs(&entries);
+        assert_eq!(correlated.len(), 4);
+        for log in &correlated {
+            assert_eq!(log.service_name, "mu-ci-worker");
+            assert_eq!(log.severity_number, 9);
+            assert_eq!(log.severity_text, "INFO");
+            let attrs: serde_json::Value =
+                serde_json::from_str(&log.attributes_json).expect("valid json");
+            assert_eq!(attrs["stream"].as_str(), Some("stderr"));
+        }
+        assert!(correlated[3].body.contains("[k3-worker error]"));
+    }
+
+    #[test]
+    fn test_finish_span_distinguishes_infra_failures_from_user_exits_and_cancellations() {
+        let cfg = sample_worker_config("x86_64", &["x86_64"]);
+        let task = sample_dispatch_task(None, false);
+        let hw = HardwareProfile::detect(&cfg, &task, None);
+        let session = StageTraceSession::from_dispatch_task(&task, &cfg.node_id, &hw);
+
+        // 1. User test/lint failure (exit 101, 1) -> span status OK with outcome attributes
+        for user_code in [1, 101] {
+            let msg = format!("Tool 'cargo-clippy' exited with status code {user_code}");
+            let span = session.finish_span(user_code, Some(&msg));
+            assert_eq!(span.service_name, "mu-ci-worker");
+            assert_eq!(span.status_code, "OK");
+            assert_eq!(span.status_message, None);
+            let attrs: serde_json::Value =
+                serde_json::from_str(&span.attributes_json).expect("valid attrs");
+            assert_eq!(attrs["exit_code"].as_i64(), Some(i64::from(user_code)));
+            assert_eq!(attrs["outcome"].as_str(), Some("user_failure"));
+            assert_eq!(attrs["infra_error"].as_bool(), Some(false));
+            assert_eq!(attrs["outcome_message"].as_str(), Some(msg.as_str()));
+        }
+
+        // 2. Stage cancellation (exit 130) -> span status OK with cancelled outcome
+        let cancel_msg = "Stage cancelled: superseded by newer push";
+        let cancel_span = session.finish_span(130, Some(cancel_msg));
+        assert_eq!(cancel_span.service_name, "mu-ci-worker");
+        assert_eq!(cancel_span.status_code, "OK");
+        assert_eq!(cancel_span.status_message, None);
+        let cancel_attrs: serde_json::Value =
+            serde_json::from_str(&cancel_span.attributes_json).expect("valid attrs");
+        assert_eq!(cancel_attrs["exit_code"].as_i64(), Some(130));
+        assert_eq!(cancel_attrs["outcome"].as_str(), Some("cancelled"));
+        assert_eq!(cancel_attrs["infra_error"].as_bool(), Some(false));
+        assert_eq!(cancel_attrs["outcome_message"].as_str(), Some(cancel_msg));
+
+        // 3. Infra / sandbox / timeout / signal kills -> span status ERROR
+        for (code, expected_outcome, msg) in [
+            (-1, "infra_failure", "Failed to spawn tool process"),
+            (126, "infra_failure", "Security grant denied"),
+            (127, "infra_failure", "Unknown or unsupported tool"),
+            (
+                124,
+                "timed_out",
+                "Tool 'cargo-miri' timed out after 1800 seconds",
+            ),
+            (
+                137,
+                "signal_terminated",
+                "Tool 'cargo-miri' terminated by signal 9 (SIGKILL) (exit code 137)",
+            ),
+        ] {
+            let err_span = session.finish_span(code, Some(msg));
+            assert_eq!(err_span.service_name, "mu-ci-worker");
+            assert_eq!(err_span.status_code, "ERROR");
+            assert_eq!(err_span.status_message.as_deref(), Some(msg));
+            let err_attrs: serde_json::Value =
+                serde_json::from_str(&err_span.attributes_json).expect("valid attrs");
+            assert_eq!(err_attrs["exit_code"].as_i64(), Some(i64::from(code)));
+            assert_eq!(err_attrs["outcome"].as_str(), Some(expected_outcome));
+            assert_eq!(err_attrs["infra_error"].as_bool(), Some(true));
+        }
     }
 
     #[test]
