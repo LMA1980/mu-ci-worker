@@ -7,140 +7,91 @@
 </p>
 
 <p align="center">
-  <a href="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/status.svg"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/status.svg" alt="CI Status"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/status.svg" alt="CI Status"/></a>
   <a href="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/score.svg"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/score.svg" alt="Quality Score"/></a>
   <a href="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/coverage.svg"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/coverage.svg" alt="Coverage"/></a>
   <a href="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/benchmark.svg"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-worker/benchmark.svg" alt="Benchmark"/></a>
 </p>
 
----
+______________________________________________________________________
 
-Lightweight, high-performance GitHub Webhook & CI execution sidecar daemon written in Rust for native **SpacemiT Key Stone K3** (8× X100 RISC-V @ 1.6GHz) hardware.
+Stateless distributed CI stage execution agent in the [`mu-ci`](https://github.com/LMA1980/mu-ci) platform, running natively on `x86_64` hosts and **SpacemiT Key Stone K3** (`riscv64gc`: 8× X100 @ `2.15 GHz` + 8× A100 @ `1.80 GHz`) hardware.
 
-`mu-ci-worker` **eats its own dog food** — whenever code is pushed to this repository, the sidecar clones or syncs the local workspace, compiles natively, runs formatting/clippy/audit/coverage, computes its quality score, and updates its own badges and scorecard in real time.
+______________________________________________________________________
 
----
+## Architecture & Capabilities
 
-## Key Capabilities
+`mu-ci-worker` is a pure cluster stage runner without an HTTP ingress server; webhook ingestion, queue management, DAG scheduling, and SVG badge/card rendering live in [`mu-ci-controller`](https://github.com/LMA1980/mu-ci-controller).
 
-- **Native RISC-V CI Execution**: Runs directly on bare-metal RISC-V cores with zero virtualization overhead.
-- **Coalescing FIFO Webhook Queue**: Serializes builds (`concurrency = 1`) for resource-constrained K3 hosts, persists queue state to `jobs_index.json`, and automatically supersedes older queued commits when newer pushes arrive for the same `(repository, ref, event)`.
-- **HMAC-SHA256 Signature Verification**: Validates GitHub's `X-Hub-Signature-256` payload signatures in constant time.
-- **Automated Local Workspace Sync**: Automatically updates branches, clones submodules (`git submodule update --init --recursive --force`), cleans untracked artifacts, and executes YAML workflows.
-- **Factory Pipeline Quality Scoring**: Evaluates tests pass-ratio, line coverage (`cargo llvm-cov`), security advisories (`cargo audit`), and linter hygiene (`cargo clippy`) to calculate an overall quality score (0–100) and letter grade (`A+` to `F`).
-- **Individual Submodule Scoring & Badges**: Automatically discovers Git submodules from `.gitmodules`, tracks individual test counts, coverage, benchmarks, and hygiene, and generates dedicated badges and multi-row scorecard pill rows.
-- **High-DPI SVG Badges & Scorecards**: Dynamic badges (`score.svg`, `status.svg`, `coverage.svg`, `benchmark.svg`) and rich multi-metric cards (`card.svg`) rendered on-the-fly.
-- **Single-Pass Line Streaming**: Streams stdout/stderr lines once in real-time 16-line `MSG_TYPE_ARROW_LOG` batches over the controller tunnel without retaining full-stage `Vec<LogEntry>` copies in memory or duplicating stage logs at stage completion. See [`specs/single-pass-line-streaming.md`](specs/single-pass-line-streaming.md).
-- **Ultra-Low Resource Footprint**: Consumes < 15 MB RAM under idle operation.
+- **WebSocket Cluster Tunnel (`mu-ci-ipc`)**: Connects outbound to [`mu-ci-controller`](https://github.com/LMA1980/mu-ci-controller) (`/api/cluster/tunnel`), registering node metadata (`WorkerRegistration` including `rustc --version` semver probed into `rust_semver`), capability `tags`, `toolchains`, and bounded `max_slots = 1` over [`mu-ci-ipc`](https://github.com/LMA1980/mu-ci-ipc) 24-byte `IpcHeader` frames (`b"K3CI"` magic) with Apache Fory control envelopes and Apache Arrow columnar payloads.
+- **Typed Tool Dispatch (`mu-ci-tools`)**: Executes the 12 compile-time registered `ToolAdapter` implementations from [`mu-ci-tools`](https://github.com/LMA1980/mu-ci-tools) via direct `execve`-style argument vectors—never invoking arbitrary shell scripts.
+- **3-Layer Monotonic Sandboxing (`mu-ci-isolation`)**: Resolves Layer 1 host ceilings (`MU_ISOLATION_CEILING_PATH`, defaulting to `/etc/mu-isolation/ceiling.yml`), Layer 2 repository profiles (`.muci/security.yml` with `.actionrunner/security.yml` fallback), and Layer 3 dispatched stage/task constraints into `KernelSandbox` (Landlock LSM, Linux namespaces, seccomp-BPF, bounded `RLIMIT_MEMLOCK`, conditional `/proc/set_ai_thread`) or `HypervisorSandbox` (KVM), failing closed with `SecurityGrantDenied` on privilege escalation attempts.
+- **Single-Pass Line Streaming & OTEL Telemetry (`mu-observable-ipc`)**: Streams stdout/stderr lines once in real-time `MSG_TYPE_ARROW_LOG` batches over the controller tunnel (see [`specs/single-pass-line-streaming.md`](specs/single-pass-line-streaming.md)) and emits `MUOB`-framed OTEL spans, logs, test case runs, and benchmark runs to [`mu-observable-collector`](https://github.com/LMA1980/mu-observable-collector) (`MUOBSERVE_COLLECTOR_ADDR`, default `127.0.0.1:4319`) via [`mu-observable-ipc`](https://github.com/LMA1980/mu-observable-ipc).
+- **Continuous Delivery (`mu-cd`)**: Managed as `mu-ci-worker.service` (`/usr/local/bin/mu-ci-worker`) via [`.mucd/mu-cd.yml`](.mucd/mu-cd.yml).
 
----
-
-## Factory Pipeline Workflows (`.actionrunner/`)
-
-Workflows are defined in YAML and triggered based on GitHub webhook events:
-
-| Workflow File | Trigger Event | Description |
-|---|---|---|
-| `.actionrunner/on-push.yml` | `push` | Formatting, Clippy `-D warnings`, Security audit, Test suite & `llvm-cov`, and release compilation |
-| `.actionrunner/on-pullrequest.yml` | `pull_request` | PR branch validation and regression verification |
-| `.actionrunner/on-tag.yml` | `push` (tags) | Production release binary validation |
-| `.actionrunner/on-merge.yml` | Post-merge events | Main branch post-merge validation |
-
----
-
-## Endpoints Reference
-
-### 1. Ingress, Queue & Inspection API
-- `GET /health` (`/api/health`) — Service healthcheck, queue status (`idle` / `busy`), queue depth, and architecture details (`riscv64`).
-- `POST /webhook` — GitHub webhook ingress endpoint (returns `202 Accepted` with `job_id`, `queue_position`, and `superseded_jobs`).
-- `GET /queue` (`/api/queue`) — Live queue monitor snapshot (`active_job`, `queued_jobs` with FIFO position & wait time, `stats`, and `recent_jobs`).
-- `GET /jobs` (`/api/jobs`) — List queued and historical jobs with metrics (supports `?repo=`, `?status=`, and `?limit=` filters).
-- `GET /jobs/{id}` (`/api/jobs/{id}`) — Query specific job status, queue position, elapsed/duration time, and metrics (including submodules).
-- `GET /jobs/{id}/log` (`/api/jobs/{id}/log`) — View full stdout/stderr build and test logs.
-
-### 2. Badges & Factory Scorecards
-- `GET /badges/{owner}/{repo}/status.svg` — Build status badge (`continuous integration | passing`).
-- `GET /badges/{owner}/{repo}/score.svg` — Quality score badge (`k3 score | 100% A+`).
-- `GET /badges/{owner}/{repo}/coverage.svg` — Code coverage badge (`coverage | 87.9%`).
-- `GET /badges/{owner}/{repo}/benchmark.svg` — Benchmark badge (`cargo bench | 49.0 ns/iter`).
-- `GET /cards/{owner}/{repo}/card.svg` — Full factory pipeline scorecard SVG.
-
-### 3. Submodule Badges & Cards
-- `GET /badges/{owner}/{submodule}/score.svg` — Standalone submodule quality score badge.
-- `GET /badges/{owner}/{repo}/submodules/{submodule}/score.svg` — Hierarchically scoped submodule score badge.
-- `GET /cards/{owner}/{submodule}/card.svg` — Dedicated submodule scorecard SVG.
-
----
-
-## Security Model & Sandboxing
-
-`mu-ci-worker` implements strict multi-layer defense against rogue code execution on public endpoints:
-
-1. **Service Account Isolation**: Runs under a dedicated, unprivileged system account (`action-runner`). User `lma1980` can sudo as `action-runner` for diagnostics (`sudo -u action-runner -i`).
-2. **Anti-RCE Pull Request Guards**:
-   - Webhooks from external repository forks are automatically rejected (`allow_fork_prs = false`).
-   - Pull request authors must hold trusted repository associations (`OWNER`, `MEMBER`, or `COLLABORATOR`).
-3. **CGroup v2 & Namespace Sandboxing**:
-   - Process sandboxing via `systemd-run` or systemd service security directives (`NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`).
-   - CGroup v2 resource envelopes enforce memory ceiling (`MemoryMax=6G`), CPU quota (`CPUQuota=600%`), and task limits (`TasksMax=1024`).
-4. **Input Sanitization & Injection Defense**:
-   - Strict repository name validation preventing directory traversal.
-   - Hexadecimal-only commit SHA validation and git argument delimiters (`--`).
-   - Blacklist filter for dangerous shell environment variables (`LD_PRELOAD`, `BASH_ENV`, etc.).
-5. **Fail-Closed HMAC Authentication**:
-   - Rejects unauthenticated webhooks on public endpoints; fails closed if secret token is unconfigured.
-
----
+______________________________________________________________________
 
 ## Configuration
 
-Environment variables configured in `/etc/action-runner/worker.env` (loaded by `action-runner-worker.service`):
+Environment variables configured in `/etc/action-runner/worker.env` (loaded by `mu-ci-worker.service`):
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `ACTION_RUNNER_CONTROLLER_URL` | `ws://127.0.0.1:8000/api/cluster/tunnel` | WebSocket tunnel endpoint on `ActionRunner-controller` |
-| `ACTION_RUNNER_CLUSTER_TOKEN` | `/etc/action-runner/cluster_token` | Shared cluster authentication token (file path or literal; fails closed if path unreadable) |
-| `ACTION_RUNNER_NODE_ID` | Hostname | Unique worker node identifier (e.g. `node-a`, `worker-riscv64`) |
-| `ACTION_RUNNER_TAGS` | Arch-dependent defaults | Comma-separated worker capability tags (`sccache` appended automatically when `sccache` binary is detected) |
-| `ACTION_RUNNER_MAX_SLOTS` | `1` | Maximum concurrent stage slots per worker node (`1` recommended; scale intra-stage parallelism via `CARGO_BUILD_JOBS`) |
-| `ACTION_RUNNER_WORKSPACE` | `/var/lib/action-runner/workspace` | Base directory for stage workspaces and git mirrors |
-| `ACTION_RUNNER_SCCACHE_BIN` | Auto-detected | Optional explicit path to `sccache` binary, or `off`/`false`/`0`/`none` to disable `sccache` on the worker |
-| `ACTION_RUNNER_SCCACHE_ENV_FILE` | `/etc/action-runner/sccache.env` | Path to optional S3/storage environment file injected into `sccache` |
+| Variable                                                              | Default                                  | Purpose                                                                                                                                          |
+| --------------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ACTION_RUNNER_CONTROLLER_URL`                                        | `ws://127.0.0.1:8000/api/cluster/tunnel` | WebSocket tunnel endpoint on `mu-ci-controller`                                                                                                  |
+| `ACTION_RUNNER_CLUSTER_TOKEN`                                         | Built-in dev fallback                    | Shared cluster authentication token (file path or literal; fails closed if path unreadable)                                                      |
+| `ACTION_RUNNER_NODE_ID`                                               | Hostname                                 | Unique worker node identifier (e.g. `node-a`, `node-b`, `worker-riscv64`)                                                                        |
+| `ACTION_RUNNER_ARCH`                                                  | Host `std::env::consts::ARCH`            | Architecture reported in `WorkerRegistration`                                                                                                    |
+| `ACTION_RUNNER_TAGS`                                                  | Arch-dependent defaults                  | Comma-separated worker capability tags (`sccache` appended automatically when `sccache` binary is detected)                                      |
+| `ACTION_RUNNER_MAX_SLOTS`                                             | `1`                                      | Maximum concurrent stage slots per worker node (`1` recommended; scale intra-stage parallelism via `ACTION_RUNNER_THREADS` / `CARGO_BUILD_JOBS`) |
+| `ACTION_RUNNER_THREADS`                                               | Arch-dependent                           | Intra-stage build/test thread budget (`CARGO_BUILD_JOBS`, `RAYON_NUM_THREADS`, `RUST_TEST_THREADS`)                                              |
+| `ACTION_RUNNER_WORKSPACE`                                             | `/var/lib/action-runner/workspace`       | Base directory for stage workspaces and git mirrors                                                                                              |
+| `ACTION_RUNNER_USE_BTRFS`                                             | Auto-detected                            | Enable Btrfs snapshot workspace optimizations (`true`/`1`)                                                                                       |
+| `ACTION_RUNNER_ISOLATION`                                             | `none`                                   | Optional `systemd-run` wrapper mode (`none` \| `systemd-run`)                                                                                    |
+| `ACTION_RUNNER_RUSTC_BIN`                                             | `rustc` on `PATH`                        | Optional explicit `rustc` binary path probed for `rust_semver`                                                                                   |
+| `ACTION_RUNNER_SCCACHE_BIN`                                           | Auto-detected                            | Optional explicit path to `sccache` binary, or `off`/`false`/`0`/`none` to disable `sccache` on the worker                                       |
+| `ACTION_RUNNER_SCCACHE_ENV_FILE`                                      | `/etc/action-runner/sccache.env`         | Path to optional S3/storage environment file injected into `sccache`                                                                             |
+| `ACTION_RUNNER_RAM_TOTAL_MB`                                          | `/proc/meminfo`                          | Optional RAM total override in MiB                                                                                                               |
+| `MU_CI_WRITE_TIMEOUT_SECS` / `ACTION_RUNNER_WRITE_TIMEOUT_SECS`       | Default tunnel timeout                   | WebSocket frame write timeout override                                                                                                           |
+| `MU_CI_PING_INTERVAL_SECS` / `ACTION_RUNNER_PING_INTERVAL_SECS`       | Default heartbeat interval               | WebSocket heartbeat/ping interval override                                                                                                       |
+| `MU_CI_LIVENESS_TIMEOUT_SECS` / `ACTION_RUNNER_LIVENESS_TIMEOUT_SECS` | Default liveness timeout                 | Controller tunnel liveness timeout override                                                                                                      |
+| `MU_ISOLATION_CEILING_PATH`                                           | `/etc/mu-isolation/ceiling.yml`          | Layer 1 operator host privilege ceiling for `mu-ci-isolation`                                                                                    |
+| `MUOBSERVE_COLLECTOR_ADDR`                                            | `127.0.0.1:4319`                         | `mu-observable-collector` `MUOB` TCP endpoint for OTEL spans/logs/test/bench batches                                                             |
 
----
+______________________________________________________________________
 
 ## Operator Guide: Shared `sccache` Compiler Cache Integration
 
-`action-runner` natively integrates with [`sccache`](https://github.com/mozilla/sccache) (local disk or S3-compatible object storage such as [Garage](https://garagehq.deuxfleurs.fr/), MinIO, or AWS S3) so distributed workers share compiled Rust and WebAssembly artifacts across CI runs.
+`mu-ci-worker` natively integrates with [`sccache`](https://github.com/mozilla/sccache) (local disk or S3-compatible object storage such as [Garage](https://garagehq.deuxfleurs.fr/), MinIO, or AWS S3) so distributed workers share compiled Rust and WebAssembly artifacts across CI runs.
 
 > **Complete Operator & Workflow Portal Guide**: See [**Operator & Workflow Guide: Distributed `sccache` Compilation Caching**](https://github.com/LMA1980/lma1980.github.io/blob/main/content/docs/sccache-guide.md) for the full architectural and operator walkthrough.
 
-### 0. How Enabling `sccache` Influences Your Experience (What to Expect)
+### 0. Default `try` Mode & Cache Semantics
 
 1. **Default-On `try` Mode (`SccacheMode::Try`)**:
-   - In ActionRunner, `sccache` defaults to **`try`** across all workflows, stages, and tasks (`tasks.<id>.sccache -> stages[i].sccache -> workflow.sccache -> try`).
-   - **Before `sccache` is installed on a worker**: `try` mode sees no `sccache` binary and transparently runs standard uncached `cargo` builds with zero errors.
-   - **The moment you install `/usr/local/bin/sccache` and restart `action-runner-worker`**: The worker advertises `"sccache"` in its capability `tags` and **automatically begins caching all eligible compilation tasks across existing and new repositories**—without requiring you to edit every `.actionrunner/ActionRunner.yml` file. (To opt out on a worker, set `ACTION_RUNNER_SCCACHE_BIN=off` in `/etc/action-runner/worker.env`; to opt out in a workflow/stage/task, set `sccache: false`.)
-2. **Cold Cache (Build #1) vs. Warm Cache (Build #2+)**:
-   - **Build #1 (Cold Cache — 5% to 10% Slower)**: The first run after installing `sccache` (or after a `rustup update` / `Cargo.lock` bump) compiles every crate from scratch, hashes inputs, and uploads `.rlib`/`.rmeta` artifacts to the cache backend. Expect Build #1 to take slightly longer than an uncached build.
-   - **Build #2+ (Warm Cache — 60% to 85% Faster)**: Subsequent pushes and pull requests fetch unchanged crates directly from `sccache`, cutting `cargo-check`, `cargo-clippy`, `cargo-test`, and `cargo-build` times dramatically.
-3. **Why `CARGO_INCREMENTAL=0` Is Automatically Enforced**:
-   - `sccache` cannot cache Rust's local incremental compilation state (`-C incremental=...`). Whenever `StageRunner` activates `sccache` for a task, it automatically sets `CARGO_INCREMENTAL=0`. Each crate is cached once as a hermetic unit and reused across all branches and worker nodes, while `target/*/incremental/` disk bloat is eliminated.
-4. **Cross-Compilation Challenges & What Shares Cache Hits Across Nodes (`x86_64` ↔ `riscv64` / `aarch64`)**:
-   - **Why `x86_64` Cross-Compilers Share Cache Hits With Each Other, But *Not* With Native `riscv64` Workers**: `sccache` hashes the **SHA-256 digest of the host `rustc` binary itself** along with `--target` and flags. Multiple `x86_64` workers cross-compiling for `riscv64gc-unknown-linux-gnu` share 100% of their cache hits in S3, while native `riscv64` workers maintain a separate hash space (all architectures safely share the same `SCCACHE_BUCKET` without collisions).
-   - **Target-Scoped `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` vs. Global `RUSTFLAGS`**: Setting global `RUSTFLAGS="-C target-cpu=spacemit-x100"` during an `x86_64 -> riscv64` cross-build breaks host `x86_64` `build.rs` scripts and proc-macros. `StageRunner::compute_toolchain_env` automatically scopes flags to `CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS` (and passes `-C link-arg=--target=riscv64-linux-gnu -C link-arg=--sysroot=/ -C link-arg=-fuse-ld=lld` for `llvm-24` or `riscv64-unknown-linux-gnu-gcc` for `gcc-17`) while leaving host `RUSTFLAGS` clean so `sccache` caches both host proc-macros and target crates.
-   - **Toolchain & Path Alignment**: All workers sharing cross-compile or native caches must use identical `rustc` versions (`/var/lib/action-runner/.rustup`), identical symlink paths (`/opt/cross-llvm-24` -> `/opt/llvm-24-spacemit-x100`, `/opt/cross-gcc-17` -> `/opt/gcc-17-spacemit-x100` with verified `bin/clang` and `bin/riscv64-unknown-linux-gnu-gcc` binaries), and identical `ACTION_RUNNER_WORKSPACE` paths (`/var/lib/action-runner/workspace`).
-   - **Cross-Compiling `sccache` for Low-RAM (`4 GiB`) Edge Workers**: Avoid running `cargo install sccache` directly on `4 GiB` RAM SBCs (which can OOM or wear out flash/overlayroot storage); instead, cross-compile `sccache` on an `x86_64` host and install the stripped binary to `/usr/local/bin/sccache`.
+   - In `mu-ci`, `sccache` defaults to **`try`** across all workflows, stages, and tasks (`tasks.<id>.sccache -> stages[i].sccache -> workflow.sccache -> try`).
+   - **Without `sccache` installed**: `try` mode sees no `sccache` binary and transparently runs standard uncached `cargo` builds.
+   - **With `/usr/local/bin/sccache` installed**: Upon restarting `mu-ci-worker.service`, the worker advertises `"sccache"` in its capability `tags` and automatically caches eligible compilation tasks across repositories without modifying `.muci/mu-ci.yml`. (To opt out on a worker, set `ACTION_RUNNER_SCCACHE_BIN=off` in `/etc/action-runner/worker.env`; to opt out in a workflow/stage/task, set `sccache: false`.)
+1. **Cold Cache (Build #1) vs. Warm Cache (Build #2+)**:
+   - **Build #1 (Cold Cache)**: Compiles every crate from scratch, hashes inputs, and uploads `.rlib`/`.rmeta` artifacts to the cache backend, taking roughly 5%–10% longer than an uncached build.
+   - **Build #2+ (Warm Cache)**: Subsequent runs fetch unchanged crates directly from `sccache`, reducing `cargo-check`, `cargo-clippy`, `cargo-test`, and `cargo-build` times by ~60%–85%.
+1. **Automatic `CARGO_INCREMENTAL=0`**:
+   - `sccache` cannot cache Rust's local incremental compilation state (`-C incremental=...`). Whenever `StageRunner` activates `sccache` for a task, it sets `CARGO_INCREMENTAL=0` so each crate is cached once as a hermetic unit and reused across branches and worker nodes without `target/*/incremental/` disk bloat.
+1. **Cross-Compilation & Cache Key Alignment (`x86_64` ↔ `riscv64` / `aarch64`)**:
+   - **`x86_64` Cross-Compilers vs. Native `riscv64` Workers**: `sccache` hashes the **SHA-256 digest of the host `rustc` binary** along with `--target` and flags. Multiple `x86_64` workers cross-compiling for `riscv64gc-unknown-linux-gnu` share cache hits in S3, while native `riscv64` workers maintain a separate hash space (all architectures safely share the same `SCCACHE_BUCKET` without collisions).
+   - **Target-Scoped `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` vs. Global `RUSTFLAGS`**: Setting global `RUSTFLAGS="-C target-cpu=spacemit-x100"` during an `x86_64 -> riscv64` cross-build breaks host `x86_64` `build.rs` scripts and proc-macros. `StageRunner::compute_toolchain_env` scopes flags to `CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS` (and passes `-C link-arg=--target=riscv64-linux-gnu -C link-arg=--sysroot=/ -C link-arg=-fuse-ld=lld` for `llvm-24` or `riscv64-unknown-linux-gnu-gcc` for `gcc-17`) while leaving host `RUSTFLAGS` clean so `sccache` caches both host proc-macros and target crates.
+   - **Toolchain & Path Alignment**: Workers sharing cross-compile or native caches must align `rustc` versions (`/var/lib/action-runner/.rustup`), symlink paths (`/opt/cross-llvm-24` -> `/opt/llvm-24-spacemit-x100`, `/opt/cross-gcc-17` -> `/opt/gcc-17-spacemit-x100` with verified `bin/clang` and `bin/riscv64-unknown-linux-gnu-gcc` binaries), and `ACTION_RUNNER_WORKSPACE` paths (`/var/lib/action-runner/workspace`).
+   - **Low-RAM (`4 GiB`) Edge Workers**: Cross-compile `sccache` on an `x86_64` host and install the stripped binary to `/usr/local/bin/sccache` instead of running `cargo install sccache` on constrained SBCs.
 
 ### 1. Install the `sccache` Binary on Each Worker Node
 
-> **Critical Service Account Rule**: Never install `sccache` only inside `/root/.cargo/bin` or a personal `/home/<user>/.cargo/bin` directory (`ProtectHome=read-only` and `MuIsolation` Landlock rules block access). Always install to **`/usr/local/bin/sccache`** (`0755 root:root`).
+> **Service Account Rule**: Never install `sccache` only inside `/root/.cargo/bin` or a personal user directory (`ProtectHome=read-only` and `mu-ci-isolation` Landlock rules block access). Install to **`/usr/local/bin/sccache`** (`0755 root:root`).
 
 `WorkerConfig::detect_sccache_bin()` probes:
+
 1. `ACTION_RUNNER_SCCACHE_BIN` (explicit path, or `off`/`false`/`0`/`none` to disable `sccache` on that worker)
-2. `/usr/local/bin/sccache` *(recommended system-wide location)*
-3. `/usr/bin/sccache`
-4. `$CARGO_HOME/bin/sccache` or `$HOME/.cargo/bin/sccache`
+1. `/usr/local/bin/sccache` *(recommended system-wide location)*
+1. `/usr/bin/sccache`
+1. `$CARGO_HOME/bin/sccache` or `$HOME/.cargo/bin/sccache`
 
 #### Option A: `x86_64` or `aarch64` Linux Worker (Official Static Binary)
 
@@ -167,9 +118,9 @@ sudo install -m 755 /var/lib/action-runner/.cargo/bin/sccache /usr/local/bin/scc
 sudo -u action-runner /usr/local/bin/sccache --version
 ```
 
-When `detect_sccache_bin()` locates a valid binary at startup, the worker **automatically appends `"sccache"`** to its advertised `tags` during controller registration (`WorkerRegistration`), making the node eligible for stages configured with `sccache: mandatory`.
+When `detect_sccache_bin()` locates a valid binary at startup, the worker automatically appends `"sccache"` to its advertised `tags` during `WorkerRegistration`, making the node eligible for stages configured with `sccache: mandatory`.
 
-### 2. Choose and Configure Your Cache Backend (`/etc/action-runner/sccache.env`)
+### 2. Configure the Cache Backend (`/etc/action-runner/sccache.env`)
 
 Create `/etc/action-runner/sccache.env` owned by the `action-runner` service account (`0700` on `/etc/action-runner` owned by `action-runner:action-runner`, **not** `root:root`):
 
@@ -197,16 +148,17 @@ sudo chown action-runner:action-runner /etc/action-runner/sccache.env
 sudo chmod 600 /etc/action-runner/sccache.env
 ```
 
-`WorkerConfig::load_sccache_env()` reads `/etc/action-runner/sccache.env` (or the path in `ACTION_RUNNER_SCCACHE_ENV_FILE`) and merges any explicit environment overrides for:
+`WorkerConfig::load_sccache_env()` reads `/etc/action-runner/sccache.env` (or `ACTION_RUNNER_SCCACHE_ENV_FILE`) and merges overrides for:
+
 - `SCCACHE_BUCKET`, `SCCACHE_REGION`, `SCCACHE_ENDPOINT`, `SCCACHE_S3_USE_SSL`, `SCCACHE_S3_KEY_PREFIX`
 - `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE`, `SCCACHE_SERVER_PORT`, `SCCACHE_SERVER_UDS`, `SCCACHE_IDLE_TIMEOUT`
 - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 
-> **Note**: Do **not** hardcode `RUSTC_WRAPPER` inside `/etc/action-runner/sccache.env` or `/etc/action-runner/worker.env`; `StageRunner` automatically filters out `RUSTC_WRAPPER` from `sccache.env` and injects it selectively per task so incompatible tools (`cargo-miri`, `cargo-llvm-cov`) are never broken.
+> **Note**: Do **not** hardcode `RUSTC_WRAPPER` inside `/etc/action-runner/sccache.env` or `/etc/action-runner/worker.env`; `StageRunner` automatically filters out `RUSTC_WRAPPER` from `sccache.env` and injects it selectively per task so incompatible tools (`cargo-miri`, `cargo-llvm-cov`) remain unaffected.
 
-### 3. Ensure `MuIsolation` (`security.yml`) Permits `sccache` Execution
+### 3. Ensure `mu-ci-isolation` (`security.yml`) Permits `sccache` Execution
 
-When repositories run under `MuIsolation` (`backend: Kernel` with Landlock LSM), ensure the directory containing `sccache` (`/usr/local/bin` or `/usr/bin`) is included in `exec_paths` and `/usr` in `read_paths` within `.actionrunner/security.yml`:
+When repositories run under [`mu-ci-isolation`](https://github.com/LMA1980/mu-ci-isolation) (`backend: Kernel` with Landlock LSM), ensure the directory containing `sccache` (`/usr/local/bin` or `/usr/bin`) is included in `exec_paths` and `/usr` in `read_paths` within `.muci/security.yml` (or legacy `.actionrunner/security.yml`):
 
 ```yaml
 default_profile: "default_ci"
@@ -226,43 +178,44 @@ profiles:
 
 ### 4. Runtime Behavior, Tool Filtering & Self-Healing
 
-For each dispatched task in a stage, `StageRunner` resolves the effective `SccacheMode` (`Off`, `Try` [default], or `Mandatory`) and applies the following invariants:
+For each dispatched task in a stage, `StageRunner` resolves the effective `SccacheMode` (`Off`, `Try` [default], or `Mandatory`) and enforces:
 
 - **Tool Eligibility Filtering**:
   - **Eligible compiler tools** (`cargo-build`, `cargo-check`, `cargo-test`, `cargo-clippy`, `cargo-bench`, `trunk`) receive `RUSTC_WRAPPER=<sccache_bin>`, `CARGO_INCREMENTAL=0`, `SCCACHE_IDLE_TIMEOUT=0`, and all S3/cache variables from `sccache.env`.
-  - **Non-compiler & incompatible tools** (`cargo-fmt`, `cargo-audit`, `mdformat`, `cargo-llvm-cov`, `cargo-miri`) automatically have `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` removed from their process environment so Miri's own wrapper and LLVM coverage instrumentation operate cleanly.
+  - **Non-compiler & incompatible tools** (`cargo-fmt`, `cargo-audit`, `mdformat`, `cargo-llvm-cov`, `cargo-miri`) automatically have `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` removed from their process environment.
 - **Pre-Flight Health Check & Local-Disk Hijack Recovery (`ensure_sccache_server_healthy`)**:
   - Before spawning an eligible compiler tool, the worker runs `sccache --show-stats` under a bounded **5-second timeout** (auto-starting the local `sccache` daemon with `sccache.env` credentials if not yet running).
-  - If `SCCACHE_BUCKET` is configured but the local `sccache` daemon reports `Cache location: Local disk` (e.g., if a user previously invoked `sccache` in a shell without `sccache.env`), `StageRunner` automatically stops the stale daemon (`sccache --stop-server`) and restarts it with the S3 environment.
+  - If `SCCACHE_BUCKET` is configured but the local `sccache` daemon reports `Cache location: Local disk`, `StageRunner` stops the stale daemon (`sccache --stop-server`) and restarts it with the S3 environment.
   - If the daemon is transiently wedged, `StageRunner` executes a single `--stop-server` + `--show-stats` recovery cycle.
 - **Failure Policy (`Try` vs. `Mandatory`)**:
-  - **`SccacheMode::Try` (default)**: If `sccache` is not installed or fails the health check (e.g. temporary S3 outage), the worker logs a warning, strips `RUSTC_WRAPPER`, and **falls back cleanly to uncached `rustc` compilation** so CI pipelines remain operational.
-  - **`SccacheMode::Mandatory`**: If `sccache` is missing or fails the health check after retry, the stage **fails closed immediately (`exit_code = 126`)** with a diagnostic error.
+  - **`SccacheMode::Try` (default)**: If `sccache` is missing or fails the health check, the worker logs a warning, strips `RUSTC_WRAPPER`, and falls back to uncached `rustc` compilation.
+  - **`SccacheMode::Mandatory`**: If `sccache` is missing or fails the health check after retry, the stage fails closed immediately (`exit_code = 126`).
 
 ### 5. Verifying Worker `sccache` Status
 
-Run the following command under the `action-runner` service account to verify S3 connectivity and cache hit rates on a worker node:
+Run under the `action-runner` service account to verify S3 connectivity and cache hit rates:
 
 ```bash
 sudo -u action-runner bash -c 'set -a && source /etc/action-runner/sccache.env && set +a && /usr/local/bin/sccache --show-stats'
 ```
 
----
+______________________________________________________________________
 
 ## Service Account Provisioning
 
 Automated provisioning script in [`deploy/setup-service-account.sh`](deploy/setup-service-account.sh):
+
 ```bash
 sudo ./deploy/setup-service-account.sh
 ```
 
-Diagnostics for `lma1980`:
+Service account shell inspection:
+
 ```bash
-# Switch to action-runner service account for log or workspace inspection:
 sudo -u action-runner -i
 ```
 
----
+______________________________________________________________________
 
 ## License
 
