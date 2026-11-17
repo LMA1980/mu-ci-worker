@@ -7,7 +7,7 @@ use mu_ci_ipc::{
     MSG_TYPE_STAGE_STARTED, MSG_TYPE_WORKER_HEARTBEAT, MSG_TYPE_WORKER_REGISTRATION,
     MSG_TYPE_WORKER_SHUTDOWN,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::concurrency::NodeConcurrencyLimiter;
 use crate::config::WorkerConfig;
-use crate::stage_runner::StageRunner;
+use crate::stage_runner::{StageExecutionResult, StageRunner};
 use crate::telemetry_emitter::{HardwareProfile, StageTraceSession};
 
 async fn wait_for_shutdown_signal() {
@@ -114,14 +114,128 @@ pub fn detect_system_memory_mb() -> (u64, u64) {
     (total_mb, used_mb)
 }
 
+type StageKey = (String, String);
+type CancelNotifierMap = HashMap<StageKey, tokio::sync::watch::Sender<Option<String>>>;
+
+fn normalize_cancel_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        "Stage cancelled by coordinator".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Builds a [`StageCompletionReport`] for a stage cancelled while queued or active.
+pub fn build_cancelled_completion_report(
+    task: &StageDispatchTask,
+    reason: &str,
+    before_permit: bool,
+) -> StageCompletionReport {
+    let normalized = normalize_cancel_reason(reason);
+    let prefix = if before_permit {
+        "Stage cancelled before permit acquisition"
+    } else {
+        "Stage cancelled"
+    };
+    StageCompletionReport {
+        job_id: task.job_id.clone(),
+        stage_id: task.stage_id.clone(),
+        exit_code: 130, // 128 + SIGINT
+        duration_secs: 0,
+        error_message: Some(format!("{prefix}: {normalized}")),
+        security_grant_denied: None,
+        traceparent: task.traceparent.clone(),
+    }
+}
+
+/// Finalizes a [`StageCompletionReport`] after `run_stage` returns, preserving any active
+/// `StageCancelTask` reason when the stage was cancelled while running.
+pub fn finalize_stage_completion_report(
+    task: &StageDispatchTask,
+    res: StageExecutionResult,
+    cancel_reason: Option<String>,
+) -> StageCompletionReport {
+    let traceparent = res.traceparent.or_else(|| task.traceparent.clone());
+    if let Some(reason) = cancel_reason {
+        if res.exit_code != 0 {
+            let normalized = normalize_cancel_reason(&reason);
+            return StageCompletionReport {
+                job_id: task.job_id.clone(),
+                stage_id: task.stage_id.clone(),
+                exit_code: 130,
+                duration_secs: res.duration_secs,
+                error_message: Some(format!("Stage cancelled: {normalized}")),
+                security_grant_denied: res.security_grant_denied,
+                traceparent,
+            };
+        }
+    }
+
+    StageCompletionReport {
+        job_id: task.job_id.clone(),
+        stage_id: task.stage_id.clone(),
+        exit_code: res.exit_code,
+        duration_secs: res.duration_secs,
+        error_message: res.error_message,
+        security_grant_denied: res.security_grant_denied,
+        traceparent,
+    }
+}
+
+async fn prepare_stage_execution_state(
+    cancel_notifiers: &RwLock<CancelNotifierMap>,
+    cancelled_stages: &RwLock<HashMap<StageKey, String>>,
+    job_id: &str,
+    stage_id: &str,
+) -> Result<tokio::sync::watch::Receiver<Option<String>>, String> {
+    let key = (job_id.to_string(), stage_id.to_string());
+    let mut notifiers = cancel_notifiers.write().await;
+    let mut cancelled = cancelled_stages.write().await;
+    if let Some(reason) = cancelled.remove(&key) {
+        return Err(reason);
+    }
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    notifiers.insert(key, tx);
+    Ok(rx)
+}
+
+async fn consume_stage_cancellation(
+    cancel_notifiers: &RwLock<CancelNotifierMap>,
+    cancelled_stages: &RwLock<HashMap<StageKey, String>>,
+    job_id: &str,
+    stage_id: &str,
+) -> Option<String> {
+    let key = (job_id.to_string(), stage_id.to_string());
+    let mut notifiers = cancel_notifiers.write().await;
+    notifiers.remove(&key);
+    let mut cancelled = cancelled_stages.write().await;
+    cancelled.remove(&key)
+}
+
+async fn send_completion_report(
+    out_tx: &mpsc::Sender<Vec<u8>>,
+    fory: &fory::Fory,
+    report: &StageCompletionReport,
+) {
+    if let Ok(comp_payload) = fory.serialize(report) {
+        let comp_hdr = IpcHeader::new(MSG_TYPE_STAGE_COMPLETION, comp_payload.len() as u32, 0, 999);
+        let mut frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + comp_payload.len());
+        frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&comp_hdr));
+        frame.extend_from_slice(&comp_payload);
+        let _ = out_tx.send(frame).await;
+    }
+}
+
 pub struct WorkerAgent {
     config: WorkerConfig,
     limiter: Arc<NodeConcurrencyLimiter>,
     execution_gate: Arc<Semaphore>,
     active_slots: Arc<AtomicU32>,
     active_stages: Arc<RwLock<Vec<String>>>,
-    active_processes: Arc<RwLock<HashMap<(String, String), u32>>>,
-    cancelled_stages: Arc<RwLock<HashSet<(String, String)>>>,
+    active_processes: Arc<RwLock<HashMap<StageKey, u32>>>,
+    cancelled_stages: Arc<RwLock<HashMap<StageKey, String>>>,
+    cancel_notifiers: Arc<RwLock<CancelNotifierMap>>,
 }
 
 impl WorkerAgent {
@@ -136,8 +250,25 @@ impl WorkerAgent {
             active_slots: Arc::new(AtomicU32::new(0)),
             active_stages: Arc::new(RwLock::new(Vec::new())),
             active_processes: Arc::new(RwLock::new(HashMap::new())),
-            cancelled_stages: Arc::new(RwLock::new(HashSet::new())),
+            cancelled_stages: Arc::new(RwLock::new(HashMap::new())),
+            cancel_notifiers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Records a [`StageCancelTask`] for either a queued or active stage, notifying any
+    /// active execution watcher and returning the active OS process ID if running.
+    pub async fn register_stage_cancel(&self, cancel_task: &StageCancelTask) -> Option<u32> {
+        let key = (cancel_task.job_id.clone(), cancel_task.stage_id.clone());
+        let reason = normalize_cancel_reason(&cancel_task.reason);
+        {
+            let notifiers = self.cancel_notifiers.read().await;
+            let mut cancelled = self.cancelled_stages.write().await;
+            if let Some(tx) = notifiers.get(&key) {
+                let _ = tx.send(Some(reason.clone()));
+            }
+            cancelled.insert(key.clone(), reason);
+        }
+        self.active_processes.write().await.remove(&key)
     }
 
     #[allow(dead_code)]
@@ -525,6 +656,7 @@ impl WorkerAgent {
                                             let active_stages = self.active_stages.clone();
                                             let active_processes = self.active_processes.clone();
                                             let cancelled_stages = self.cancelled_stages.clone();
+                                            let cancel_notifiers = self.cancel_notifiers.clone();
                                             let total_slots = self.config.max_slots.max(1);
                                             let node_id = self.config.node_id.clone();
                                             let comp_fory = create_fory_runtime()?;
@@ -560,51 +692,37 @@ impl WorkerAgent {
                                                     }
                                                 };
 
-                                                // Check if cancelled while waiting for permit
-                                                let is_cancelled = {
-                                                    let mut set = cancelled_stages.write().await;
-                                                    set.remove(&(task.job_id.clone(), task.stage_id.clone()))
-                                                };
-
-                                                if is_cancelled {
-                                                    info!(
-                                                        job_id = %task.job_id,
-                                                        stage = %task.stage_id,
-                                                        "Stage was cancelled while queued in execution gate; releasing permit immediately"
-                                                    );
-                                                    let report = StageCompletionReport {
-                                                        job_id: task.job_id.clone(),
-                                                        stage_id: task.stage_id.clone(),
-                                                        exit_code: 130, // 128 + SIGINT
-                                                        duration_secs: 0,
-                                                        error_message: Some(
-                                                            "Stage cancelled before permit acquisition"
-                                                                .to_string(),
-                                                        ),
-                                                        security_grant_denied: None,
-                                                        traceparent: task.traceparent.clone(),
-                                                    };
-                                                    if let Ok(comp_payload) =
-                                                        comp_fory.serialize(&report)
-                                                    {
-                                                        let comp_hdr = IpcHeader::new(
-                                                            MSG_TYPE_STAGE_COMPLETION,
-                                                            comp_payload.len() as u32,
-                                                            0,
-                                                            999,
+                                                // Check if cancelled while waiting for permit and register active watcher atomically
+                                                let cancel_rx = match prepare_stage_execution_state(
+                                                    &cancel_notifiers,
+                                                    &cancelled_stages,
+                                                    &task.job_id,
+                                                    &task.stage_id,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(rx) => rx,
+                                                    Err(reason) => {
+                                                        info!(
+                                                            job_id = %task.job_id,
+                                                            stage = %task.stage_id,
+                                                            reason = %reason,
+                                                            "Stage was cancelled while queued in execution gate; releasing permit immediately"
                                                         );
-                                                        let mut frame = Vec::with_capacity(
-                                                            mu_ci_ipc::HEADER_SIZE
-                                                                + comp_payload.len(),
+                                                        let report = build_cancelled_completion_report(
+                                                            &task,
+                                                            &reason,
+                                                            true,
                                                         );
-                                                        frame.extend_from_slice(
-                                                            zerocopy::IntoBytes::as_bytes(&comp_hdr),
-                                                        );
-                                                        frame.extend_from_slice(&comp_payload);
-                                                        let _ = out_tx.send(frame).await;
+                                                        send_completion_report(
+                                                            &out_tx,
+                                                            &comp_fory,
+                                                            &report,
+                                                        )
+                                                        .await;
+                                                        return;
                                                     }
-                                                    return;
-                                                }
+                                                };
 
                                                 info!(
                                                     job_id = %task.job_id,
@@ -637,7 +755,7 @@ impl WorkerAgent {
                                                     .echo_traceparent,
                                                 );
 
-                                                tokio::spawn(async move {
+                                                let started_handle = tokio::spawn(async move {
                                                     if let Ok(pid) = started_rx.await {
                                                         active_proc_reg.write().await.insert(
                                                             (
@@ -701,7 +819,7 @@ impl WorkerAgent {
                                                                 batch_bytes.len() as u32,
                                                                 0,
                                                                 l_seq,
-                                                            );
+                                                             );
                                                             let mut frame = Vec::with_capacity(
                                                                 mu_ci_ipc::HEADER_SIZE
                                                                     + batch_bytes.len(),
@@ -718,12 +836,14 @@ impl WorkerAgent {
                                                 };
 
                                                 let res = runner
-                                                    .run_stage(
+                                                    .run_stage_with_cancel(
                                                         &task,
                                                         log_batch_tx,
                                                         Some(started_tx),
+                                                        Some(cancel_rx),
                                                     )
                                                     .await;
+                                                let _ = started_handle.await;
                                                 let _ = log_forwarder.await;
 
                                                 active_counter
@@ -737,35 +857,21 @@ impl WorkerAgent {
                                                     .await
                                                     .remove(&(task.job_id.clone(), task.stage_id.clone()));
 
-                                                let report = StageCompletionReport {
-                                                    job_id: task.job_id.clone(),
-                                                    stage_id: task.stage_id.clone(),
-                                                    exit_code: res.exit_code,
-                                                    duration_secs: res.duration_secs,
-                                                    error_message: res.error_message,
-                                                    security_grant_denied: res.security_grant_denied,
-                                                    traceparent: res.traceparent.or_else(|| task.traceparent.clone()),
-                                                };
+                                                let cancel_reason = consume_stage_cancellation(
+                                                    &cancel_notifiers,
+                                                    &cancelled_stages,
+                                                    &task.job_id,
+                                                    &task.stage_id,
+                                                )
+                                                .await;
 
-                                                if let Ok(comp_payload) =
-                                                    comp_fory.serialize(&report)
-                                                {
-                                                    let comp_hdr = IpcHeader::new(
-                                                        MSG_TYPE_STAGE_COMPLETION,
-                                                        comp_payload.len() as u32,
-                                                        0,
-                                                        999,
-                                                    );
-                                                    let mut frame = Vec::with_capacity(
-                                                        mu_ci_ipc::HEADER_SIZE
-                                                            + comp_payload.len(),
-                                                    );
-                                                    frame.extend_from_slice(
-                                                        zerocopy::IntoBytes::as_bytes(&comp_hdr),
-                                                    );
-                                                    frame.extend_from_slice(&comp_payload);
-                                                    let _ = out_tx.send(frame).await;
-                                                }
+                                                let report = finalize_stage_completion_report(
+                                                    &task,
+                                                    res,
+                                                    cancel_reason,
+                                                );
+                                                send_completion_report(&out_tx, &comp_fory, &report)
+                                                    .await;
                                             });
                                         }
                                         Err(e) => {
@@ -785,25 +891,14 @@ impl WorkerAgent {
                                             reason = %cancel_task.reason,
                                             "Worker received StageCancelTask; checking for active process"
                                         );
-                                        // Register cancellation in case stage is queued waiting for permits
-                                        self.cancelled_stages.write().await.insert((
-                                            cancel_task.job_id.clone(),
-                                            cancel_task.stage_id.clone(),
-                                        ));
-
-                                        let maybe_pid = self
-                                            .active_processes
-                                            .write()
-                                            .await
-                                            .remove(&(
-                                                cancel_task.job_id.clone(),
-                                                cancel_task.stage_id.clone(),
-                                            ));
+                                        let maybe_pid =
+                                            self.register_stage_cancel(&cancel_task).await;
                                         if let Some(pid) = maybe_pid {
                                             info!(
                                                 job_id = %cancel_task.job_id,
                                                 stage = %cancel_task.stage_id,
                                                 pid = pid,
+                                                reason = %cancel_task.reason,
                                                 "Terminating active process group via SIGTERM"
                                             );
                                             #[cfg(unix)]
@@ -887,5 +982,160 @@ Cached:          1572864 kB
     fn test_parse_proc_meminfo_invalid_returns_none() {
         assert_eq!(parse_proc_meminfo(""), None);
         assert_eq!(parse_proc_meminfo("MemTotal: 0 kB\n"), None);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_active_and_queued_stage_cancel_preserves_reason_and_consumes_state() {
+        let mut config = WorkerConfig::load();
+        config.node_id = "worker-test".to_string();
+        let worker = WorkerAgent::new(config);
+
+        let task = StageDispatchTask {
+            job_id: "job-cancel-72".to_string(),
+            stage_id: "test-check".to_string(),
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+            ..Default::default()
+        };
+
+        // 1. Active stage cancellation: prepare watcher, register running PID, receive StageCancelTask
+        let mut cancel_rx = prepare_stage_execution_state(
+            &worker.cancel_notifiers,
+            &worker.cancelled_stages,
+            &task.job_id,
+            &task.stage_id,
+        )
+        .await
+        .expect("stage not yet cancelled");
+
+        worker
+            .active_processes
+            .write()
+            .await
+            .insert((task.job_id.clone(), task.stage_id.clone()), 424242);
+
+        let cancel_task = StageCancelTask {
+            job_id: task.job_id.clone(),
+            stage_id: task.stage_id.clone(),
+            reason: "Superseded by newer push to feat/branch".to_string(),
+        };
+        let killed_pid = worker.register_stage_cancel(&cancel_task).await;
+        assert_eq!(killed_pid, Some(424242));
+        assert_eq!(
+            cancel_rx.borrow_and_update().as_deref(),
+            Some("Superseded by newer push to feat/branch")
+        );
+
+        let consumed_reason = consume_stage_cancellation(
+            &worker.cancel_notifiers,
+            &worker.cancelled_stages,
+            &task.job_id,
+            &task.stage_id,
+        )
+        .await;
+        assert_eq!(
+            consumed_reason.as_deref(),
+            Some("Superseded by newer push to feat/branch")
+        );
+        // State is cleanly consumed so subsequent lookups return None.
+        assert_eq!(
+            consume_stage_cancellation(
+                &worker.cancel_notifiers,
+                &worker.cancelled_stages,
+                &task.job_id,
+                &task.stage_id,
+            )
+            .await,
+            None
+        );
+
+        // Simulate child killed by SIGTERM (143) before runner saw cancel_rx
+        let raw_sigterm_result = StageExecutionResult {
+            exit_code: 143,
+            duration_secs: 4,
+            pid: 424242,
+            error_message: Some(
+                "Tool 'cargo-test' terminated by signal 15 (SIGTERM) (exit code 143)".to_string(),
+            ),
+            security_grant_denied: None,
+            traceparent: task.traceparent.clone(),
+            child_span: None,
+            test_case_runs: Vec::new(),
+            benchmark_runs: Vec::new(),
+        };
+        let report = finalize_stage_completion_report(&task, raw_sigterm_result, consumed_reason);
+        assert_eq!(report.exit_code, 130);
+        assert_eq!(
+            report.error_message.as_deref(),
+            Some("Stage cancelled: Superseded by newer push to feat/branch")
+        );
+
+        // 2. Queued stage cancellation before permit acquisition
+        let queued_cancel = StageCancelTask {
+            job_id: "job-queued-72".to_string(),
+            stage_id: "clippy-check".to_string(),
+            reason: "Cancelled by user".to_string(),
+        };
+        assert_eq!(worker.register_stage_cancel(&queued_cancel).await, None);
+        let queued_err = prepare_stage_execution_state(
+            &worker.cancel_notifiers,
+            &worker.cancelled_stages,
+            "job-queued-72",
+            "clippy-check",
+        )
+        .await
+        .expect_err("queued cancellation must be observed before launch");
+        assert_eq!(queued_err, "Cancelled by user");
+        let queued_report = build_cancelled_completion_report(&task, &queued_err, true);
+        assert_eq!(queued_report.exit_code, 130);
+        assert_eq!(
+            queued_report.error_message.as_deref(),
+            Some("Stage cancelled before permit acquisition: Cancelled by user")
+        );
+    }
+
+    #[test]
+    fn test_finalize_stage_completion_report_preserves_zero_exit_and_normal_failures() {
+        let task = StageDispatchTask {
+            job_id: "job-normal".to_string(),
+            stage_id: "test-check".to_string(),
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+            ..Default::default()
+        };
+        let ok_res = StageExecutionResult {
+            exit_code: 0,
+            duration_secs: 2,
+            pid: 100,
+            error_message: None,
+            security_grant_denied: None,
+            traceparent: None,
+            child_span: None,
+            test_case_runs: Vec::new(),
+            benchmark_runs: Vec::new(),
+        };
+        let ok_report =
+            finalize_stage_completion_report(&task, ok_res, Some("late cancel".to_string()));
+        assert_eq!(ok_report.exit_code, 0);
+        assert_eq!(ok_report.error_message, None);
+        assert_eq!(ok_report.traceparent, task.traceparent);
+
+        let crash_res = StageExecutionResult {
+            exit_code: 137,
+            duration_secs: 5,
+            pid: 101,
+            error_message: Some("Tool 'cargo-miri' terminated by signal 9 (SIGKILL)".to_string()),
+            security_grant_denied: None,
+            traceparent: None,
+            child_span: None,
+            test_case_runs: Vec::new(),
+            benchmark_runs: Vec::new(),
+        };
+        let crash_report = finalize_stage_completion_report(&task, crash_res, None);
+        assert_eq!(crash_report.exit_code, 137);
+        assert!(crash_report
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("SIGKILL"));
     }
 }

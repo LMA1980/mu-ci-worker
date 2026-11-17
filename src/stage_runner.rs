@@ -20,7 +20,7 @@ use crate::sandbox::WorkerSandboxRunner;
 use crate::telemetry_emitter::{
     convert_metrics_to_benchmark_entries, convert_metrics_to_test_entries,
     extract_crate_name_from_invocation, BenchmarkRunEntry, HardwareProfile, OtelSpanEntry,
-    StageTraceSession, TelemetryEmitter, TestCaseRunEntry,
+    StageSpanOutcome, StageTraceSession, TelemetryEmitter, TestCaseRunEntry,
 };
 
 /// Canonical execution and validation errors for the worker stage runner.
@@ -300,6 +300,228 @@ impl StageExecutionResult {
     }
 }
 
+/// Maps a POSIX signal number to its canonical name for process diagnostics.
+#[cfg(unix)]
+fn unix_signal_name(sig: i32) -> Option<&'static str> {
+    match sig {
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGQUIT => Some("SIGQUIT"),
+        libc::SIGILL => Some("SIGILL"),
+        libc::SIGTRAP => Some("SIGTRAP"),
+        libc::SIGABRT => Some("SIGABRT"),
+        libc::SIGBUS => Some("SIGBUS"),
+        libc::SIGFPE => Some("SIGFPE"),
+        libc::SIGKILL => Some("SIGKILL"),
+        libc::SIGUSR1 => Some("SIGUSR1"),
+        libc::SIGSEGV => Some("SIGSEGV"),
+        libc::SIGUSR2 => Some("SIGUSR2"),
+        libc::SIGPIPE => Some("SIGPIPE"),
+        libc::SIGALRM => Some("SIGALRM"),
+        libc::SIGTERM => Some("SIGTERM"),
+        libc::SIGSYS => Some("SIGSYS"),
+        libc::SIGXCPU => Some("SIGXCPU"),
+        libc::SIGXFSZ => Some("SIGXFSZ"),
+        _ => None,
+    }
+}
+
+/// Resolves a completed [`std::process::ExitStatus`] into a canonical exit code (`128 + sig`
+/// on Unix signal kills) and a diagnostic error message when non-zero.
+#[must_use]
+pub fn resolve_exit_status(
+    tool_name: &str,
+    status: std::process::ExitStatus,
+) -> (i32, Option<String>) {
+    if let Some(code) = status.code() {
+        if code == 0 {
+            return (0, None);
+        }
+        return (
+            code,
+            Some(format!("Tool '{tool_name}' exited with status code {code}")),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let code = 128_i32.saturating_add(sig);
+            let core_note = if status.core_dumped() {
+                " (core dumped)"
+            } else {
+                ""
+            };
+            let msg = match unix_signal_name(sig) {
+                Some(name) => format!(
+                    "Tool '{tool_name}' terminated by signal {sig} ({name}){core_note} (exit code {code})"
+                ),
+                None => format!(
+                    "Tool '{tool_name}' terminated by signal {sig}{core_note} (exit code {code})"
+                ),
+            };
+            return (code, Some(msg));
+        }
+    }
+
+    (
+        -1,
+        Some(format!(
+            "Tool '{tool_name}' exited with unknown status (no exit code or signal)"
+        )),
+    )
+}
+
+fn current_cancel_reason(
+    cancel_rx: &Option<tokio::sync::watch::Receiver<Option<String>>>,
+) -> Option<String> {
+    cancel_rx.as_ref().and_then(|rx| rx.borrow().clone())
+}
+
+async fn wait_for_cancel_signal(
+    cancel_rx: &mut Option<tokio::sync::watch::Receiver<Option<String>>>,
+) -> String {
+    let Some(rx) = cancel_rx.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(reason) = rx.borrow().clone() {
+            return reason;
+        }
+        if rx.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
+/// Terminates the entire child process group (`-pid` on Unix) via `SIGTERM`,
+/// escalating to `SIGKILL` after a short grace period, and reaps `child`.
+async fn terminate_child_process_group(child: &mut tokio::process::Child, pid: u32) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+
+    #[cfg(unix)]
+    if let Some(raw_pid) = i32::try_from(pid).ok().filter(|&p| p > 0) {
+        unsafe {
+            let _ = libc::kill(-raw_pid, libc::SIGTERM);
+            let _ = libc::kill(raw_pid, libc::SIGTERM);
+        }
+        if timeout(Duration::from_millis(200), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        unsafe {
+            let _ = libc::kill(-raw_pid, libc::SIGKILL);
+            let _ = libc::kill(raw_pid, libc::SIGKILL);
+        }
+    }
+
+    let _ = child.kill().await;
+    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+}
+
+/// Drains `out_handle` and `err_handle` after process termination with a bounded timeout,
+/// escalating to `SIGKILL` on `-pid` if a grandchild keeps stdio pipes open past `150ms`.
+async fn drain_stdio_after_termination(
+    out_handle: tokio::task::JoinHandle<Vec<u8>>,
+    err_handle: tokio::task::JoinHandle<Vec<u8>>,
+    pid: u32,
+    drain_timeout: Duration,
+) -> (Vec<u8>, Vec<u8>) {
+    let out_abort = out_handle.abort_handle();
+    let err_abort = err_handle.abort_handle();
+    let mut join_fut = std::pin::pin!(async move {
+        let (out_res, err_res) = tokio::join!(out_handle, err_handle);
+        (out_res.unwrap_or_default(), err_res.unwrap_or_default())
+    });
+
+    if pid == 0 {
+        return match timeout(drain_timeout, &mut join_fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                out_abort.abort();
+                err_abort.abort();
+                (Vec::new(), Vec::new())
+            }
+        };
+    }
+
+    tokio::select! {
+        res = &mut join_fut => res,
+        _ = tokio::time::sleep(Duration::from_millis(150)) => {
+            #[cfg(unix)]
+            if let Some(raw_pid) = i32::try_from(pid).ok().filter(|&p| p > 0) {
+                unsafe {
+                    let _ = libc::kill(-raw_pid, libc::SIGKILL);
+                    let _ = libc::kill(raw_pid, libc::SIGKILL);
+                }
+            }
+            match timeout(drain_timeout, &mut join_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    out_abort.abort();
+                    err_abort.abort();
+                    (Vec::new(), Vec::new())
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_and_collect_metrics(
+    config: &WorkerConfig,
+    adapter: &dyn mu_ci_tools::ToolAdapter,
+    task: &StageDispatchTask,
+    inv: &TypedTaskInvocation,
+    stdout_bytes: &[u8],
+    stderr_bytes: &[u8],
+    exit_code: i32,
+    trace_session: &mut StageTraceSession,
+    all_test_runs: &mut Vec<TestCaseRunEntry>,
+    all_bench_runs: &mut Vec<BenchmarkRunEntry>,
+) {
+    let parse_start = std::time::Instant::now();
+    let parsed = match adapter.parse_metrics(stdout_bytes, stderr_bytes, exit_code) {
+        Ok(m) => Ok(m),
+        Err(mu_ci_tools::MetricParseError::InvalidUtf8) => {
+            let lossy_out = String::from_utf8_lossy(stdout_bytes);
+            let lossy_err = String::from_utf8_lossy(stderr_bytes);
+            adapter.parse_metrics(lossy_out.as_bytes(), lossy_err.as_bytes(), exit_code)
+        }
+        Err(e) => Err(e),
+    };
+    if let Ok(metrics) = parsed {
+        let now_ns = Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(trace_session.start_time_unix_nano);
+        let inv_hw = HardwareProfile::detect(config, task, Some(inv));
+        let crate_name = extract_crate_name_from_invocation(inv, &task.repo_name);
+        all_test_runs.extend(convert_metrics_to_test_entries(
+            &metrics,
+            task,
+            &crate_name,
+            &inv.tool_name,
+            &config.node_id,
+            &inv_hw,
+            now_ns,
+        ));
+        all_bench_runs.extend(convert_metrics_to_benchmark_entries(
+            &metrics,
+            task,
+            &crate_name,
+            &config.node_id,
+            &inv_hw,
+            now_ns,
+        ));
+    }
+    trace_session.record_metric_parse_ns(parse_start.elapsed().as_nanos() as u64);
+}
+
 /// Helper creating a ToolRegistry equipped with built-in adapters and extended flag support for worker diagnostics.
 fn build_worker_tool_registry() -> mu_ci_tools::ToolRegistry {
     let mut registry = mu_ci_tools::ToolRegistry::with_builtin_adapters();
@@ -397,6 +619,17 @@ impl StageRunner {
         log_tx: mpsc::Sender<Vec<u8>>,
         started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> StageExecutionResult {
+        self.run_stage_with_cancel(task, log_tx, started_tx, None)
+            .await
+    }
+
+    pub async fn run_stage_with_cancel(
+        &self,
+        task: &StageDispatchTask,
+        log_tx: mpsc::Sender<Vec<u8>>,
+        started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+        mut cancel_rx: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    ) -> StageExecutionResult {
         let start_time = Utc::now();
         let stage_hardware = HardwareProfile::detect(&self.config, task, task.tasks.first());
         let mut trace_session =
@@ -483,9 +716,39 @@ impl StageRunner {
             }
         }
 
+        if let Some(reason) = current_cancel_reason(&cancel_rx) {
+            let err_msg = format!("Stage cancelled: {reason}");
+            let res = StageExecutionResult::failed_early(&trace_session, 130, 0, 0, err_msg, None);
+            if let Some(span) = &res.child_span {
+                let _ = self
+                    .telemetry_emitter
+                    .emit_stage_bundle(std::slice::from_ref(span), &[], &[], &[])
+                    .await;
+            }
+            return res;
+        }
+
         let setup_start = std::time::Instant::now();
         let stage_dir = self.prepare_stage_workspace(task, &log_tx).await;
         trace_session.record_sandbox_setup_ns(setup_start.elapsed().as_nanos() as u64);
+
+        if let Some(reason) = current_cancel_reason(&cancel_rx) {
+            let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
+            return self
+                .finalize_stage_failure(
+                    &stage_dir,
+                    &trace_session,
+                    StageSpanOutcome::Cancelled,
+                    130,
+                    duration_secs,
+                    0,
+                    format!("Stage cancelled: {reason}"),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await;
+        }
 
         if let Err(err_msg) =
             validate_and_resolve_working_dir(&stage_dir, task.working_dir.as_deref())
@@ -525,13 +788,320 @@ impl StageRunner {
             return res;
         }
 
-        self.run_v3_typed_tasks(task, &stage_dir, log_tx, started_tx, ctx, trace_session)
-            .await
+        self.run_v3_typed_tasks(
+            task,
+            &stage_dir,
+            log_tx,
+            started_tx,
+            ctx,
+            trace_session,
+            &mut cancel_rx,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_stage_failure(
+        &self,
+        stage_dir: &Path,
+        trace_session: &StageTraceSession,
+        outcome: StageSpanOutcome,
+        exit_code: i32,
+        duration_secs: u64,
+        pid: u32,
+        error_message: String,
+        security_grant_denied: Option<SecurityGrantDenied>,
+        all_test_runs: Vec<TestCaseRunEntry>,
+        all_bench_runs: Vec<BenchmarkRunEntry>,
+    ) -> StageExecutionResult {
+        self.cleanup_stage_workspace(stage_dir).await;
+        let child_span =
+            trace_session.finish_span_with_outcome(exit_code, outcome, Some(&error_message));
+        let _ = self
+            .telemetry_emitter
+            .emit_stage_bundle(
+                std::slice::from_ref(&child_span),
+                &[],
+                &all_test_runs,
+                &all_bench_runs,
+            )
+            .await;
+        StageExecutionResult {
+            exit_code,
+            duration_secs,
+            pid,
+            error_message: Some(error_message),
+            security_grant_denied,
+            traceparent: Some(trace_session.echo_traceparent.clone()),
+            child_span: Some(child_span),
+            test_case_runs: all_test_runs,
+            benchmark_runs: all_bench_runs,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tool_process(
+        &self,
+        mut cmd: Command,
+        adapter: &dyn mu_ci_tools::ToolAdapter,
+        task: &StageDispatchTask,
+        inv: &TypedTaskInvocation,
+        argv: &[OsString],
+        log_tx: &mpsc::Sender<Vec<u8>>,
+        started_tx: &mut Option<tokio::sync::oneshot::Sender<u32>>,
+        line_counter: &Arc<AtomicU32>,
+        trace_session: &mut StageTraceSession,
+        cancel_rx: &mut Option<tokio::sync::watch::Receiver<Option<String>>>,
+        all_test_runs: &mut Vec<TestCaseRunEntry>,
+        all_bench_runs: &mut Vec<BenchmarkRunEntry>,
+    ) -> Result<u32, (u32, i32, StageSpanOutcome, String)> {
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let tool_exec_start = std::time::Instant::now();
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let err_msg = format!(
+                    "Failed to spawn tool process '{}' ({:?}): {}",
+                    inv.tool_name, argv, e
+                );
+                error!("{}", err_msg);
+                return Err((0, -1, StageSpanOutcome::InfraFailure, err_msg));
+            }
+        };
+
+        let pid = child.id().unwrap_or(0);
+        if let Some(tx) = started_tx.take() {
+            let _ = tx.send(pid);
+        }
+
+        let spawn_entry = LogEntry {
+            timestamp_us: Utc::now().timestamp_micros(),
+            job_id: task.job_id.clone(),
+            stage_id: task.stage_id.clone(),
+            node_id: self.config.node_id.clone(),
+            stream: 1,
+            line_no: 0,
+            content: format!(
+                "[ActionRunner-rs] Direct tool process spawned with PID {} ({:?})",
+                pid, argv
+            ),
+        };
+        if let Ok(bytes) = encode_log_batch(&[spawn_entry]) {
+            let _ = log_tx.send(bytes).await;
+        }
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let out_handle = {
+            let log_tx = log_tx.clone();
+            let node_id = self.config.node_id.clone();
+            let job_id = task.job_id.clone();
+            let stage_id = task.stage_id.clone();
+            let line_counter = line_counter.clone();
+
+            tokio::spawn(async move {
+                match stdout {
+                    Some(out) => {
+                        pump_stream_with_flush_ticker(
+                            out,
+                            1,
+                            job_id,
+                            stage_id,
+                            node_id,
+                            line_counter,
+                            log_tx,
+                        )
+                        .await
+                    }
+                    None => Vec::new(),
+                }
+            })
+        };
+
+        let err_handle = {
+            let log_tx = log_tx.clone();
+            let node_id = self.config.node_id.clone();
+            let job_id = task.job_id.clone();
+            let stage_id = task.stage_id.clone();
+            let line_counter = line_counter.clone();
+
+            tokio::spawn(async move {
+                match stderr {
+                    Some(err) => {
+                        pump_stream_with_flush_ticker(
+                            err,
+                            2,
+                            job_id,
+                            stage_id,
+                            node_id,
+                            line_counter,
+                            log_tx,
+                        )
+                        .await
+                    }
+                    None => Vec::new(),
+                }
+            })
+        };
+
+        enum ChildWaitOutcome {
+            Finished(std::io::Result<std::process::ExitStatus>),
+            TimedOut,
+            Cancelled(String),
+        }
+
+        let wait_outcome = if let Some(reason) = current_cancel_reason(cancel_rx) {
+            ChildWaitOutcome::Cancelled(reason)
+        } else {
+            let timeout_duration = Duration::from_secs(task.timeout_seconds);
+            tokio::select! {
+                res = child.wait() => {
+                    match res {
+                        Ok(status) if !status.success() => {
+                            if let Some(reason) = current_cancel_reason(cancel_rx) {
+                                ChildWaitOutcome::Cancelled(reason)
+                            } else {
+                                ChildWaitOutcome::Finished(Ok(status))
+                            }
+                        }
+                        other => ChildWaitOutcome::Finished(other),
+                    }
+                }
+                _ = tokio::time::sleep(timeout_duration) => ChildWaitOutcome::TimedOut,
+                reason = wait_for_cancel_signal(cancel_rx) => ChildWaitOutcome::Cancelled(reason),
+            }
+        };
+
+        match wait_outcome {
+            ChildWaitOutcome::Finished(Ok(status)) => {
+                let (stdout_bytes, stderr_bytes) = drain_stdio_after_termination(
+                    out_handle,
+                    err_handle,
+                    0,
+                    Duration::from_secs(5),
+                )
+                .await;
+                trace_session.record_tool_execution_ns(tool_exec_start.elapsed().as_nanos() as u64);
+
+                let (code, err_msg) = resolve_exit_status(&inv.tool_name, status);
+                parse_and_collect_metrics(
+                    &self.config,
+                    adapter,
+                    task,
+                    inv,
+                    &stdout_bytes,
+                    &stderr_bytes,
+                    code,
+                    trace_session,
+                    all_test_runs,
+                    all_bench_runs,
+                );
+                if let Some(msg) = err_msg {
+                    let outcome = StageSpanOutcome::classify(code, Some(&msg));
+                    return Err((pid, code, outcome, msg));
+                }
+                Ok(pid)
+            }
+            ChildWaitOutcome::Finished(Err(e)) => {
+                terminate_child_process_group(&mut child, pid).await;
+                let (stdout_bytes, stderr_bytes) = drain_stdio_after_termination(
+                    out_handle,
+                    err_handle,
+                    pid,
+                    Duration::from_secs(2),
+                )
+                .await;
+                trace_session.record_tool_execution_ns(tool_exec_start.elapsed().as_nanos() as u64);
+                parse_and_collect_metrics(
+                    &self.config,
+                    adapter,
+                    task,
+                    inv,
+                    &stdout_bytes,
+                    &stderr_bytes,
+                    -1,
+                    trace_session,
+                    all_test_runs,
+                    all_bench_runs,
+                );
+                Err((
+                    pid,
+                    -1,
+                    StageSpanOutcome::InfraFailure,
+                    format!("I/O wait error: {e}"),
+                ))
+            }
+            ChildWaitOutcome::TimedOut => {
+                terminate_child_process_group(&mut child, pid).await;
+                let (stdout_bytes, stderr_bytes) = drain_stdio_after_termination(
+                    out_handle,
+                    err_handle,
+                    pid,
+                    Duration::from_secs(2),
+                )
+                .await;
+                trace_session.record_tool_execution_ns(tool_exec_start.elapsed().as_nanos() as u64);
+                parse_and_collect_metrics(
+                    &self.config,
+                    adapter,
+                    task,
+                    inv,
+                    &stdout_bytes,
+                    &stderr_bytes,
+                    124,
+                    trace_session,
+                    all_test_runs,
+                    all_bench_runs,
+                );
+                Err((
+                    pid,
+                    124,
+                    StageSpanOutcome::TimedOut,
+                    format!(
+                        "Tool '{}' timed out after {} seconds",
+                        inv.tool_name, task.timeout_seconds
+                    ),
+                ))
+            }
+            ChildWaitOutcome::Cancelled(reason) => {
+                terminate_child_process_group(&mut child, pid).await;
+                let (stdout_bytes, stderr_bytes) = drain_stdio_after_termination(
+                    out_handle,
+                    err_handle,
+                    pid,
+                    Duration::from_secs(2),
+                )
+                .await;
+                trace_session.record_tool_execution_ns(tool_exec_start.elapsed().as_nanos() as u64);
+                parse_and_collect_metrics(
+                    &self.config,
+                    adapter,
+                    task,
+                    inv,
+                    &stdout_bytes,
+                    &stderr_bytes,
+                    130,
+                    trace_session,
+                    all_test_runs,
+                    all_bench_runs,
+                );
+                Err((
+                    pid,
+                    130,
+                    StageSpanOutcome::Cancelled,
+                    format!("Stage cancelled: {reason}"),
+                ))
+            }
+        }
     }
 
     /// Sub-tasks #20, #21, #24, #25, #33, #34: Execute typed tasks via `ToolAdapter::build_argv()`
     /// directly inside attenuated `MuIsolation` sandbox without shell wrappers, correlating logs
     /// and metrics into W3C-linked Arrow telemetry batches.
+    #[allow(clippy::too_many_arguments)]
     async fn run_v3_typed_tasks(
         &self,
         task: &StageDispatchTask,
@@ -540,6 +1110,7 @@ impl StageRunner {
         mut started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
         ctx: ExecutionContext,
         mut trace_session: StageTraceSession,
+        cancel_rx: &mut Option<tokio::sync::watch::Receiver<Option<String>>>,
     ) -> StageExecutionResult {
         let start_time = ctx.start_time;
         let build_jobs = ctx.build_jobs;
@@ -550,6 +1121,24 @@ impl StageRunner {
         let mut all_bench_runs: Vec<BenchmarkRunEntry> = Vec::new();
 
         for inv in &task.tasks {
+            if let Some(reason) = current_cancel_reason(cancel_rx) {
+                let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
+                return self
+                    .finalize_stage_failure(
+                        stage_dir,
+                        &trace_session,
+                        StageSpanOutcome::Cancelled,
+                        130,
+                        duration_secs,
+                        last_pid,
+                        format!("Stage cancelled: {reason}"),
+                        None,
+                        all_test_runs,
+                        all_bench_runs,
+                    )
+                    .await;
+            }
+
             let sandbox_step_start = std::time::Instant::now();
             // 1. #25: Shell prohibition check on tool_name and args
             let empty_argv: [OsString; 0] = [];
@@ -560,28 +1149,21 @@ impl StageRunner {
                     "Prohibited shell invocation in typed task tool_name: {}",
                     e
                 );
-                self.cleanup_stage_workspace(stage_dir).await;
                 let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                let res = StageExecutionResult::failed_early(
-                    &trace_session,
-                    126,
-                    duration_secs,
-                    0,
-                    e.to_string(),
-                    None,
-                );
-                if let Some(span) = &res.child_span {
-                    let _ = self
-                        .telemetry_emitter
-                        .emit_stage_bundle(
-                            std::slice::from_ref(span),
-                            &[],
-                            &all_test_runs,
-                            &all_bench_runs,
-                        )
-                        .await;
-                }
-                return res;
+                return self
+                    .finalize_stage_failure(
+                        stage_dir,
+                        &trace_session,
+                        StageSpanOutcome::InfraFailure,
+                        126,
+                        duration_secs,
+                        0,
+                        e.to_string(),
+                        None,
+                        all_test_runs,
+                        all_bench_runs,
+                    )
+                    .await;
             }
 
             for arg in &inv.args {
@@ -591,28 +1173,21 @@ impl StageRunner {
                         reason: format!("prohibited shell wrapper or flag in args: '{arg}'"),
                     };
                     error!("{}", err);
-                    self.cleanup_stage_workspace(stage_dir).await;
                     let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                    let res = StageExecutionResult::failed_early(
-                        &trace_session,
-                        126,
-                        duration_secs,
-                        0,
-                        err.to_string(),
-                        None,
-                    );
-                    if let Some(span) = &res.child_span {
-                        let _ = self
-                            .telemetry_emitter
-                            .emit_stage_bundle(
-                                std::slice::from_ref(span),
-                                &[],
-                                &all_test_runs,
-                                &all_bench_runs,
-                            )
-                            .await;
-                    }
-                    return res;
+                    return self
+                        .finalize_stage_failure(
+                            stage_dir,
+                            &trace_session,
+                            StageSpanOutcome::InfraFailure,
+                            126,
+                            duration_secs,
+                            0,
+                            err.to_string(),
+                            None,
+                            all_test_runs,
+                            all_bench_runs,
+                        )
+                        .await;
                 }
             }
 
@@ -622,28 +1197,21 @@ impl StageRunner {
                 Err(e) => {
                     let err_msg = format!("Unknown or unsupported tool '{}': {}", inv.tool_name, e);
                     error!("{}", err_msg);
-                    self.cleanup_stage_workspace(stage_dir).await;
                     let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                    let res = StageExecutionResult::failed_early(
-                        &trace_session,
-                        127,
-                        duration_secs,
-                        0,
-                        err_msg,
-                        None,
-                    );
-                    if let Some(span) = &res.child_span {
-                        let _ = self
-                            .telemetry_emitter
-                            .emit_stage_bundle(
-                                std::slice::from_ref(span),
-                                &[],
-                                &all_test_runs,
-                                &all_bench_runs,
-                            )
-                            .await;
-                    }
-                    return res;
+                    return self
+                        .finalize_stage_failure(
+                            stage_dir,
+                            &trace_session,
+                            StageSpanOutcome::InfraFailure,
+                            127,
+                            duration_secs,
+                            0,
+                            err_msg,
+                            None,
+                            all_test_runs,
+                            all_bench_runs,
+                        )
+                        .await;
                 }
             };
 
@@ -662,28 +1230,21 @@ impl StageRunner {
                     inv.tool_name, val_err
                 );
                 error!("{}", err_msg);
-                self.cleanup_stage_workspace(stage_dir).await;
                 let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                let res = StageExecutionResult::failed_early(
-                    &trace_session,
-                    126,
-                    duration_secs,
-                    0,
-                    err_msg,
-                    None,
-                );
-                if let Some(span) = &res.child_span {
-                    let _ = self
-                        .telemetry_emitter
-                        .emit_stage_bundle(
-                            std::slice::from_ref(span),
-                            &[],
-                            &all_test_runs,
-                            &all_bench_runs,
-                        )
-                        .await;
-                }
-                return res;
+                return self
+                    .finalize_stage_failure(
+                        stage_dir,
+                        &trace_session,
+                        StageSpanOutcome::InfraFailure,
+                        126,
+                        duration_secs,
+                        0,
+                        err_msg,
+                        None,
+                        all_test_runs,
+                        all_bench_runs,
+                    )
+                    .await;
             }
 
             let argv = match adapter.build_argv(&tool_inv) {
@@ -694,28 +1255,21 @@ impl StageRunner {
                         inv.tool_name, build_err
                     );
                     error!("{}", err_msg);
-                    self.cleanup_stage_workspace(stage_dir).await;
                     let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                    let res = StageExecutionResult::failed_early(
-                        &trace_session,
-                        126,
-                        duration_secs,
-                        0,
-                        err_msg,
-                        None,
-                    );
-                    if let Some(span) = &res.child_span {
-                        let _ = self
-                            .telemetry_emitter
-                            .emit_stage_bundle(
-                                std::slice::from_ref(span),
-                                &[],
-                                &all_test_runs,
-                                &all_bench_runs,
-                            )
-                            .await;
-                    }
-                    return res;
+                    return self
+                        .finalize_stage_failure(
+                            stage_dir,
+                            &trace_session,
+                            StageSpanOutcome::InfraFailure,
+                            126,
+                            duration_secs,
+                            0,
+                            err_msg,
+                            None,
+                            all_test_runs,
+                            all_bench_runs,
+                        )
+                        .await;
                 }
             };
 
@@ -727,28 +1281,21 @@ impl StageRunner {
                     "Prohibited shell invocation in built argv: {}",
                     e
                 );
-                self.cleanup_stage_workspace(stage_dir).await;
                 let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                let res = StageExecutionResult::failed_early(
-                    &trace_session,
-                    126,
-                    duration_secs,
-                    0,
-                    e.to_string(),
-                    None,
-                );
-                if let Some(span) = &res.child_span {
-                    let _ = self
-                        .telemetry_emitter
-                        .emit_stage_bundle(
-                            std::slice::from_ref(span),
-                            &[],
-                            &all_test_runs,
-                            &all_bench_runs,
-                        )
-                        .await;
-                }
-                return res;
+                return self
+                    .finalize_stage_failure(
+                        stage_dir,
+                        &trace_session,
+                        StageSpanOutcome::InfraFailure,
+                        126,
+                        duration_secs,
+                        0,
+                        e.to_string(),
+                        None,
+                        all_test_runs,
+                        all_bench_runs,
+                    )
+                    .await;
             }
 
             // 5. #20 & #21: Attenuate sandbox constraints
@@ -762,28 +1309,21 @@ impl StageRunner {
                 Ok(eff) => eff,
                 Err(err) => {
                     let (denied, msg) = WorkerSandboxRunner::handle_security_violation(task, &err);
-                    self.cleanup_stage_workspace(stage_dir).await;
                     let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                    let res = StageExecutionResult::failed_early(
-                        &trace_session,
-                        126,
-                        duration_secs,
-                        0,
-                        msg,
-                        Some(denied),
-                    );
-                    if let Some(span) = &res.child_span {
-                        let _ = self
-                            .telemetry_emitter
-                            .emit_stage_bundle(
-                                std::slice::from_ref(span),
-                                &[],
-                                &all_test_runs,
-                                &all_bench_runs,
-                            )
-                            .await;
-                    }
-                    return res;
+                    return self
+                        .finalize_stage_failure(
+                            stage_dir,
+                            &trace_session,
+                            StageSpanOutcome::InfraFailure,
+                            126,
+                            duration_secs,
+                            0,
+                            msg,
+                            Some(denied),
+                            all_test_runs,
+                            all_bench_runs,
+                        )
+                        .await;
                 }
             };
 
@@ -791,28 +1331,21 @@ impl StageRunner {
                 Ok(p) => p,
                 Err(err) => {
                     let (denied, msg) = WorkerSandboxRunner::handle_security_violation(task, &err);
-                    self.cleanup_stage_workspace(stage_dir).await;
                     let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                    let res = StageExecutionResult::failed_early(
-                        &trace_session,
-                        126,
-                        duration_secs,
-                        0,
-                        msg,
-                        Some(denied),
-                    );
-                    if let Some(span) = &res.child_span {
-                        let _ = self
-                            .telemetry_emitter
-                            .emit_stage_bundle(
-                                std::slice::from_ref(span),
-                                &[],
-                                &all_test_runs,
-                                &all_bench_runs,
-                            )
-                            .await;
-                    }
-                    return res;
+                    return self
+                        .finalize_stage_failure(
+                            stage_dir,
+                            &trace_session,
+                            StageSpanOutcome::InfraFailure,
+                            126,
+                            duration_secs,
+                            0,
+                            msg,
+                            Some(denied),
+                            all_test_runs,
+                            all_bench_runs,
+                        )
+                        .await;
                 }
             };
 
@@ -837,28 +1370,21 @@ impl StageRunner {
                 Ok(p) => p,
                 Err(e) => {
                     error!("{}", e);
-                    self.cleanup_stage_workspace(stage_dir).await;
                     let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                    let res = StageExecutionResult::failed_early(
-                        &trace_session,
-                        -1,
-                        duration_secs,
-                        0,
-                        e,
-                        None,
-                    );
-                    if let Some(span) = &res.child_span {
-                        let _ = self
-                            .telemetry_emitter
-                            .emit_stage_bundle(
-                                std::slice::from_ref(span),
-                                &[],
-                                &all_test_runs,
-                                &all_bench_runs,
-                            )
-                            .await;
-                    }
-                    return res;
+                    return self
+                        .finalize_stage_failure(
+                            stage_dir,
+                            &trace_session,
+                            StageSpanOutcome::InfraFailure,
+                            -1,
+                            duration_secs,
+                            0,
+                            e,
+                            None,
+                            all_test_runs,
+                            all_bench_runs,
+                        )
+                        .await;
                 }
             };
 
@@ -898,266 +1424,59 @@ impl StageRunner {
                     task_id = %inv.task_id,
                     "{}", sccache_err
                 );
-                self.cleanup_stage_workspace(stage_dir).await;
                 let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                let res = StageExecutionResult::failed_early(
-                    &trace_session,
-                    126,
-                    duration_secs,
-                    0,
-                    sccache_err,
-                    None,
-                );
-                if let Some(span) = &res.child_span {
-                    let _ = self
-                        .telemetry_emitter
-                        .emit_stage_bundle(
-                            std::slice::from_ref(span),
-                            &[],
-                            &all_test_runs,
-                            &all_bench_runs,
-                        )
-                        .await;
-                }
-                return res;
-            }
-
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-
-            let tool_exec_start = std::time::Instant::now();
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    let err_msg = format!(
-                        "Failed to spawn tool process '{}' ({:?}): {}",
-                        inv.tool_name, argv, e
-                    );
-                    error!("{}", err_msg);
-                    self.cleanup_stage_workspace(stage_dir).await;
-                    let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-                    let res = StageExecutionResult::failed_early(
+                return self
+                    .finalize_stage_failure(
+                        stage_dir,
                         &trace_session,
-                        -1,
+                        StageSpanOutcome::InfraFailure,
+                        126,
                         duration_secs,
                         0,
-                        err_msg,
+                        sccache_err,
                         None,
-                    );
-                    if let Some(span) = &res.child_span {
-                        let _ = self
-                            .telemetry_emitter
-                            .emit_stage_bundle(
-                                std::slice::from_ref(span),
-                                &[],
-                                &all_test_runs,
-                                &all_bench_runs,
-                            )
-                            .await;
-                    }
-                    return res;
+                        all_test_runs,
+                        all_bench_runs,
+                    )
+                    .await;
+            }
+
+            match self
+                .execute_tool_process(
+                    cmd,
+                    adapter,
+                    task,
+                    inv,
+                    &argv,
+                    &log_tx,
+                    &mut started_tx,
+                    &line_counter,
+                    &mut trace_session,
+                    cancel_rx,
+                    &mut all_test_runs,
+                    &mut all_bench_runs,
+                )
+                .await
+            {
+                Ok(pid) => {
+                    last_pid = pid;
                 }
-            };
-
-            let pid = child.id().unwrap_or(0);
-            last_pid = pid;
-            if let Some(tx) = started_tx.take() {
-                let _ = tx.send(pid);
-            }
-
-            let spawn_entry = LogEntry {
-                timestamp_us: Utc::now().timestamp_micros(),
-                job_id: task.job_id.clone(),
-                stage_id: task.stage_id.clone(),
-                node_id: self.config.node_id.clone(),
-                stream: 1,
-                line_no: 0,
-                content: format!(
-                    "[ActionRunner-rs] Direct tool process spawned with PID {} ({:?})",
-                    pid, argv
-                ),
-            };
-            if let Ok(bytes) = encode_log_batch(&[spawn_entry]) {
-                let _ = log_tx.send(bytes).await;
-            }
-
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-
-            let out_handle = {
-                let log_tx = log_tx.clone();
-                let node_id = self.config.node_id.clone();
-                let job_id = task.job_id.clone();
-                let stage_id = task.stage_id.clone();
-                let line_counter = line_counter.clone();
-
-                tokio::spawn(async move {
-                    match stdout {
-                        Some(out) => {
-                            pump_stream_with_flush_ticker(
-                                out,
-                                1,
-                                job_id,
-                                stage_id,
-                                node_id,
-                                line_counter,
-                                log_tx,
-                            )
-                            .await
-                        }
-                        None => Vec::new(),
-                    }
-                })
-            };
-
-            let err_handle = {
-                let log_tx = log_tx.clone();
-                let node_id = self.config.node_id.clone();
-                let job_id = task.job_id.clone();
-                let stage_id = task.stage_id.clone();
-                let line_counter = line_counter.clone();
-
-                tokio::spawn(async move {
-                    match stderr {
-                        Some(err) => {
-                            pump_stream_with_flush_ticker(
-                                err,
-                                2,
-                                job_id,
-                                stage_id,
-                                node_id,
-                                line_counter,
-                                log_tx,
-                            )
-                            .await
-                        }
-                        None => Vec::new(),
-                    }
-                })
-            };
-
-            let timeout_duration = Duration::from_secs(task.timeout_seconds);
-            let execution_result = timeout(timeout_duration, child.wait()).await;
-
-            let stdout_bytes = out_handle.await.unwrap_or_default();
-            let stderr_bytes = err_handle.await.unwrap_or_default();
-            trace_session.record_tool_execution_ns(tool_exec_start.elapsed().as_nanos() as u64);
-
-            let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
-
-            match execution_result {
-                Ok(Ok(status)) => {
-                    let code = status.code().unwrap_or(-1);
-                    let parse_start = std::time::Instant::now();
-                    if let Ok(metrics) = adapter.parse_metrics(&stdout_bytes, &stderr_bytes, code) {
-                        let now_ns = Utc::now()
-                            .timestamp_nanos_opt()
-                            .unwrap_or(trace_session.start_time_unix_nano);
-                        let inv_hw = HardwareProfile::detect(&self.config, task, Some(inv));
-                        let crate_name = extract_crate_name_from_invocation(inv, &task.repo_name);
-                        all_test_runs.extend(convert_metrics_to_test_entries(
-                            &metrics,
-                            task,
-                            &crate_name,
-                            &inv.tool_name,
-                            &self.config.node_id,
-                            &inv_hw,
-                            now_ns,
-                        ));
-                        all_bench_runs.extend(convert_metrics_to_benchmark_entries(
-                            &metrics,
-                            task,
-                            &crate_name,
-                            &self.config.node_id,
-                            &inv_hw,
-                            now_ns,
-                        ));
-                    }
-                    trace_session.record_metric_parse_ns(parse_start.elapsed().as_nanos() as u64);
-
-                    if code != 0 {
-                        self.cleanup_stage_workspace(stage_dir).await;
-                        let err_msg = format!(
-                            "Tool '{}' exited with status code {:?}",
-                            inv.tool_name,
-                            status.code()
-                        );
-                        let child_span = trace_session.finish_span(code, Some(&err_msg));
-                        let _ = self
-                            .telemetry_emitter
-                            .emit_stage_bundle(
-                                std::slice::from_ref(&child_span),
-                                &[],
-                                &all_test_runs,
-                                &all_bench_runs,
-                            )
-                            .await;
-                        return StageExecutionResult {
-                            exit_code: code,
+                Err((pid, code, outcome, err_msg)) => {
+                    let duration_secs = (Utc::now() - start_time).num_seconds().max(0) as u64;
+                    return self
+                        .finalize_stage_failure(
+                            stage_dir,
+                            &trace_session,
+                            outcome,
+                            code,
                             duration_secs,
                             pid,
-                            error_message: Some(err_msg),
-                            security_grant_denied: None,
-                            traceparent: Some(trace_session.echo_traceparent),
-                            child_span: Some(child_span),
-                            test_case_runs: all_test_runs,
-                            benchmark_runs: all_bench_runs,
-                        };
-                    }
-                }
-                Ok(Err(e)) => {
-                    self.cleanup_stage_workspace(stage_dir).await;
-                    let err_msg = format!("I/O wait error: {}", e);
-                    let child_span = trace_session.finish_span(-1, Some(&err_msg));
-                    let _ = self
-                        .telemetry_emitter
-                        .emit_stage_bundle(
-                            std::slice::from_ref(&child_span),
-                            &[],
-                            &all_test_runs,
-                            &all_bench_runs,
+                            err_msg,
+                            None,
+                            all_test_runs,
+                            all_bench_runs,
                         )
                         .await;
-                    return StageExecutionResult {
-                        exit_code: -1,
-                        duration_secs,
-                        pid,
-                        error_message: Some(err_msg),
-                        security_grant_denied: None,
-                        traceparent: Some(trace_session.echo_traceparent),
-                        child_span: Some(child_span),
-                        test_case_runs: all_test_runs,
-                        benchmark_runs: all_bench_runs,
-                    };
-                }
-                Err(_) => {
-                    let _ = child.kill().await;
-                    self.cleanup_stage_workspace(stage_dir).await;
-                    let err_msg = format!(
-                        "Tool '{}' timed out after {} seconds",
-                        inv.tool_name, task.timeout_seconds
-                    );
-                    let child_span = trace_session.finish_span(124, Some(&err_msg));
-                    let _ = self
-                        .telemetry_emitter
-                        .emit_stage_bundle(
-                            std::slice::from_ref(&child_span),
-                            &[],
-                            &all_test_runs,
-                            &all_bench_runs,
-                        )
-                        .await;
-                    return StageExecutionResult {
-                        exit_code: 124,
-                        duration_secs,
-                        pid,
-                        error_message: Some(err_msg),
-                        security_grant_denied: None,
-                        traceparent: Some(trace_session.echo_traceparent),
-                        child_span: Some(child_span),
-                        test_case_runs: all_test_runs,
-                        benchmark_runs: all_bench_runs,
-                    };
                 }
             }
         }
@@ -1619,6 +1938,78 @@ impl StageRunner {
         Ok(())
     }
 
+    fn emit_git_log_lines(
+        &self,
+        task: &StageDispatchTask,
+        stream_id: i8,
+        bytes: &[u8],
+        log_tx: &mpsc::Sender<Vec<u8>>,
+    ) {
+        let mut batch = Vec::new();
+        for chunk in bytes.split(|&b| b == b'\n' || b == b'\r') {
+            if chunk.is_empty() {
+                continue;
+            }
+            let line = String::from_utf8_lossy(chunk);
+            if line.trim().is_empty() {
+                continue;
+            }
+            batch.push(LogEntry {
+                timestamp_us: Utc::now().timestamp_micros(),
+                job_id: task.job_id.clone(),
+                stage_id: "step-0".to_string(),
+                node_id: self.config.node_id.clone(),
+                stream: stream_id,
+                line_no: 0,
+                content: line.into_owned(),
+            });
+            if batch.len() >= 16 {
+                if let Ok(encoded) = encode_log_batch(&batch) {
+                    let _ = log_tx.try_send(encoded);
+                }
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            if let Ok(encoded) = encode_log_batch(&batch) {
+                let _ = log_tx.try_send(encoded);
+            }
+        }
+    }
+
+    async fn run_git_captured(
+        &self,
+        mut cmd: Command,
+        task: &StageDispatchTask,
+        log_tx: &mpsc::Sender<Vec<u8>>,
+    ) -> bool {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match cmd.output().await {
+            Ok(output) => {
+                self.emit_git_log_lines(task, 1, &output.stdout, log_tx);
+                self.emit_git_log_lines(task, 2, &output.stderr, log_tx);
+                output.status.success()
+            }
+            Err(e) => {
+                let entry = LogEntry {
+                    timestamp_us: Utc::now().timestamp_micros(),
+                    job_id: task.job_id.clone(),
+                    stage_id: "step-0".to_string(),
+                    node_id: self.config.node_id.clone(),
+                    stream: 2,
+                    line_no: 0,
+                    content: format!("[ActionRunner-rs] Git command spawn error: {e}"),
+                };
+                if let Ok(encoded) = encode_log_batch(&[entry]) {
+                    let _ = log_tx.try_send(encoded);
+                }
+                false
+            }
+        }
+    }
+
     async fn prepare_stage_workspace(
         &self,
         task: &StageDispatchTask,
@@ -1662,7 +2053,7 @@ impl StageRunner {
         let _ = tokio::fs::create_dir_all(&stages_dir).await;
 
         // Sync git cache mirror if needed
-        self.sync_git_cache(task, &repo_cache).await;
+        self.sync_git_cache(task, &repo_cache, log_tx).await;
 
         // Btrfs snapshot creation or directory copy
         if self.config.use_btrfs {
@@ -1683,27 +2074,27 @@ impl StageRunner {
                         "Created isolated Btrfs subvolume snapshot"
                     );
 
-                    let _ = Command::new("git")
+                    let mut checkout_cmd = Command::new("git");
+                    checkout_cmd
                         .arg("checkout")
                         .arg("-f")
                         .arg(&task.commit_sha)
-                        .current_dir(&stage_dir)
-                        .status()
-                        .await;
+                        .current_dir(&stage_dir);
+                    let _ = self.run_git_captured(checkout_cmd, task, log_tx).await;
 
                     emit_git_log(format!(
                         "[ActionRunner-rs] Checked out target commit '{}' into stage workspace",
                         task.commit_sha
                     ));
 
-                    let _ = Command::new("git")
+                    let mut submod_cmd = Command::new("git");
+                    submod_cmd
                         .arg("submodule")
                         .arg("update")
                         .arg("--init")
                         .arg("--recursive")
-                        .current_dir(&stage_dir)
-                        .status()
-                        .await;
+                        .current_dir(&stage_dir);
+                    let _ = self.run_git_captured(submod_cmd, task, log_tx).await;
 
                     emit_git_log(
                         "[ActionRunner-rs] Git submodules synchronized successfully".to_string(),
@@ -1719,15 +2110,15 @@ impl StageRunner {
         let mut cloned = false;
         let max_attempts = if has_clone_url { 3u32 } else { 1u32 };
         for attempt in 1..=max_attempts {
-            let status = Command::new("git")
+            let mut clone_cmd = Command::new("git");
+            clone_cmd
                 .arg("clone")
                 .arg("--reference")
                 .arg(&repo_cache)
                 .arg(&task.clone_url)
-                .arg(&stage_dir)
-                .status()
-                .await;
-            if status.is_ok_and(|s| s.success()) && stage_dir.join(".git").exists() {
+                .arg(&stage_dir);
+            let ok = self.run_git_captured(clone_cmd, task, log_tx).await;
+            if ok && stage_dir.join(".git").exists() {
                 cloned = true;
                 break;
             }
@@ -1738,45 +2129,46 @@ impl StageRunner {
             }
         }
         if !cloned && (repo_cache.join(".git").exists() || repo_cache.join("HEAD").exists()) {
-            let _ = Command::new("git")
+            let mut shared_clone_cmd = Command::new("git");
+            shared_clone_cmd
                 .arg("clone")
                 .arg("--shared")
                 .arg(&repo_cache)
-                .arg(&stage_dir)
-                .status()
-                .await;
-            let _ = Command::new("git")
+                .arg(&stage_dir);
+            let _ = self.run_git_captured(shared_clone_cmd, task, log_tx).await;
+
+            let mut fetch_cmd = Command::new("git");
+            fetch_cmd
                 .arg("fetch")
                 .arg(&repo_cache)
                 .arg(&task.commit_sha)
-                .current_dir(&stage_dir)
-                .status()
-                .await;
+                .current_dir(&stage_dir);
+            let _ = self.run_git_captured(fetch_cmd, task, log_tx).await;
         }
 
-        let checkout_ok = Command::new("git")
+        let mut checkout_cmd = Command::new("git");
+        checkout_cmd
             .arg("checkout")
             .arg("-f")
             .arg(&task.commit_sha)
-            .current_dir(&stage_dir)
-            .status()
-            .await
-            .is_ok_and(|s| s.success());
+            .current_dir(&stage_dir);
+        let checkout_ok = self.run_git_captured(checkout_cmd, task, log_tx).await;
         if !checkout_ok && (repo_cache.join(".git").exists() || repo_cache.join("HEAD").exists()) {
-            let _ = Command::new("git")
+            let mut fetch_cmd = Command::new("git");
+            fetch_cmd
                 .arg("fetch")
                 .arg(&repo_cache)
                 .arg(&task.commit_sha)
-                .current_dir(&stage_dir)
-                .status()
-                .await;
-            let _ = Command::new("git")
+                .current_dir(&stage_dir);
+            let _ = self.run_git_captured(fetch_cmd, task, log_tx).await;
+
+            let mut fetch_head_cmd = Command::new("git");
+            fetch_head_cmd
                 .arg("checkout")
                 .arg("-f")
                 .arg("FETCH_HEAD")
-                .current_dir(&stage_dir)
-                .status()
-                .await;
+                .current_dir(&stage_dir);
+            let _ = self.run_git_captured(fetch_head_cmd, task, log_tx).await;
         }
 
         emit_git_log(format!(
@@ -1784,21 +2176,26 @@ impl StageRunner {
             task.commit_sha
         ));
 
-        let _ = Command::new("git")
+        let mut submod_cmd = Command::new("git");
+        submod_cmd
             .arg("submodule")
             .arg("update")
             .arg("--init")
             .arg("--recursive")
-            .current_dir(&stage_dir)
-            .status()
-            .await;
+            .current_dir(&stage_dir);
+        let _ = self.run_git_captured(submod_cmd, task, log_tx).await;
 
         emit_git_log("[ActionRunner-rs] Git submodules synchronized successfully".to_string());
 
         stage_dir
     }
 
-    async fn sync_git_cache(&self, task: &StageDispatchTask, repo_cache: &Path) {
+    async fn sync_git_cache(
+        &self,
+        task: &StageDispatchTask,
+        repo_cache: &Path,
+        log_tx: &mpsc::Sender<Vec<u8>>,
+    ) {
         let max_attempts = if task.clone_url.trim().is_empty() {
             1u32
         } else {
@@ -1809,13 +2206,9 @@ impl StageRunner {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
             for attempt in 1..=max_attempts {
-                let ok = Command::new("git")
-                    .arg("clone")
-                    .arg(&task.clone_url)
-                    .arg(repo_cache)
-                    .status()
-                    .await
-                    .is_ok_and(|s| s.success());
+                let mut clone_cmd = Command::new("git");
+                clone_cmd.arg("clone").arg(&task.clone_url).arg(repo_cache);
+                let ok = self.run_git_captured(clone_cmd, task, log_tx).await;
                 if ok {
                     break;
                 }
@@ -1826,14 +2219,13 @@ impl StageRunner {
             }
         } else {
             for attempt in 1..=max_attempts {
-                let ok = Command::new("git")
+                let mut fetch_cmd = Command::new("git");
+                fetch_cmd
                     .arg("fetch")
                     .arg("origin")
                     .arg(&task.commit_sha)
-                    .current_dir(repo_cache)
-                    .status()
-                    .await
-                    .is_ok_and(|s| s.success());
+                    .current_dir(repo_cache);
+                let ok = self.run_git_captured(fetch_cmd, task, log_tx).await;
                 if ok {
                     break;
                 }
@@ -1883,10 +2275,11 @@ impl StageRunner {
     }
 }
 
-/// Reads lines from an async stream (`stdout` = 1, `stderr` = 2) and flushes encoded
-/// [`LogEntry`] batches over `log_tx` whenever 16 lines accumulate OR a `250ms`
-/// interval elapses with a non-empty buffer, preventing multi-minute stalls and
-/// out-of-order `stderr` tail dumps on long-running stages (`#49`).
+/// Reads byte lines from an async stream (`stdout` = 1, `stderr` = 2) lossily using
+/// `read_until(b'\n')` + `String::from_utf8_lossy` and flushes encoded [`LogEntry`] batches
+/// over `log_tx` whenever 16 lines accumulate OR a `250ms` interval elapses with a non-empty
+/// buffer, preventing multi-minute stalls, invalid-UTF-8 truncation, and out-of-order `stderr`
+/// tail dumps on long-running stages (`#49`, `#79`).
 async fn pump_stream_with_flush_ticker<R>(
     stream_reader: R,
     stream_id: i8,
@@ -1900,31 +2293,46 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut collected_bytes = Vec::new();
-    let mut reader = BufReader::new(stream_reader).lines();
+    let mut reader = BufReader::new(stream_reader);
+    let mut line_buf = Vec::new();
     let mut buffer = Vec::new();
     let mut flush_tick = tokio::time::interval(Duration::from_millis(250));
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     flush_tick.tick().await;
 
+    let push_line = |raw_line: &mut Vec<u8>, collected: &mut Vec<u8>, buf: &mut Vec<LogEntry>| {
+        collected.extend_from_slice(raw_line);
+        let mut end = raw_line.len();
+        while end > 0 && (raw_line[end - 1] == b'\n' || raw_line[end - 1] == b'\r') {
+            end -= 1;
+        }
+        let content = String::from_utf8_lossy(&raw_line[..end]).replace('\r', "");
+        raw_line.clear();
+
+        let l_num = line_counter.fetch_add(1, Ordering::Relaxed);
+        buf.push(LogEntry {
+            timestamp_us: Utc::now().timestamp_micros(),
+            job_id: job_id.clone(),
+            stage_id: stage_id.clone(),
+            node_id: node_id.clone(),
+            stream: stream_id,
+            line_no: l_num,
+            content,
+        });
+    };
+
     loop {
         tokio::select! {
-            res = reader.next_line() => {
+            res = reader.read_until(b'\n', &mut line_buf) => {
                 match res {
-                    Ok(Some(line)) => {
-                        collected_bytes.extend_from_slice(line.as_bytes());
-                        collected_bytes.push(b'\n');
-                        let l_num = line_counter.fetch_add(1, Ordering::Relaxed);
-                        let entry = LogEntry {
-                            timestamp_us: Utc::now().timestamp_micros(),
-                            job_id: job_id.clone(),
-                            stage_id: stage_id.clone(),
-                            node_id: node_id.clone(),
-                            stream: stream_id,
-                            line_no: l_num,
-                            content: line,
-                        };
-                        buffer.push(entry);
-
+                    Ok(0) => {
+                        if !line_buf.is_empty() {
+                            push_line(&mut line_buf, &mut collected_bytes, &mut buffer);
+                        }
+                        break;
+                    }
+                    Ok(_) => {
+                        push_line(&mut line_buf, &mut collected_bytes, &mut buffer);
                         if buffer.len() >= 16 {
                             if let Ok(bytes) = encode_log_batch(&buffer) {
                                 let _ = log_tx.send(bytes).await;
@@ -1932,7 +2340,12 @@ where
                             buffer.clear();
                         }
                     }
-                    _ => break,
+                    Err(_) => {
+                        if !line_buf.is_empty() {
+                            push_line(&mut line_buf, &mut collected_bytes, &mut buffer);
+                        }
+                        break;
+                    }
                 }
             }
             _ = flush_tick.tick(), if !buffer.is_empty() => {
@@ -2817,5 +3230,437 @@ allow_spacemit_ai_thread: false
         drop(writer);
         let collected = pump_task.await.expect("pump task join");
         assert!(String::from_utf8_lossy(&collected).contains("Running unittests"));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_pump_stream_with_flush_ticker_handles_non_utf8_lossily_to_eof() {
+        use mu_ci_ipc::decode_log_batch;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (log_tx, mut log_rx) = mpsc::channel::<Vec<u8>>(16);
+        let line_counter = Arc::new(AtomicU32::new(1));
+
+        let pump_task = tokio::spawn(pump_stream_with_flush_ticker(
+            reader,
+            1,
+            "job-utf8-lossy".to_string(),
+            "test-check".to_string(),
+            "worker-riscv64".to_string(),
+            line_counter,
+            log_tx,
+        ));
+
+        let raw_payload =
+            b"line one ok\nline two \xff\xfe invalid utf8\r\nline three after invalid\nfinal partial line";
+        writer
+            .write_all(raw_payload)
+            .await
+            .expect("write raw bytes");
+        drop(writer);
+
+        let collected = pump_task.await.expect("pump task join");
+        assert_eq!(collected, raw_payload);
+
+        let mut entries = Vec::new();
+        while let Ok(batch_bytes) = log_rx.try_recv() {
+            entries.extend(decode_log_batch(&batch_bytes).expect("decode batch"));
+        }
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].content, "line one ok");
+        assert_eq!(entries[1].content, "line two \u{FFFD}\u{FFFD} invalid utf8");
+        assert_eq!(entries[2].content, "line three after invalid");
+        assert_eq!(entries[3].content, "final partial line");
+        for entry in &entries {
+            assert!(!entry.content.contains('\n') && !entry.content.contains('\r'));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_resolve_exit_status_reports_unix_signals() {
+        let mut child_kill = Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep for SIGKILL");
+        let pid_kill = child_kill.id().expect("child pid") as i32;
+        unsafe {
+            assert_eq!(libc::kill(pid_kill, libc::SIGKILL), 0);
+        }
+        let status_kill = child_kill.wait().await.expect("wait SIGKILL");
+        let (code_kill, msg_kill) = resolve_exit_status("cargo-miri", status_kill);
+        assert_eq!(code_kill, 137);
+        let msg_kill = msg_kill.expect("SIGKILL diagnostic");
+        assert!(msg_kill.contains("signal 9"));
+        assert!(msg_kill.contains("SIGKILL"));
+        assert!(msg_kill.contains("137"));
+
+        let mut child_term = Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep for SIGTERM");
+        let pid_term = child_term.id().expect("child pid") as i32;
+        unsafe {
+            assert_eq!(libc::kill(pid_term, libc::SIGTERM), 0);
+        }
+        let status_term = child_term.wait().await.expect("wait SIGTERM");
+        let (code_term, msg_term) = resolve_exit_status("cargo-test", status_term);
+        assert_eq!(code_term, 143);
+        let msg_term = msg_term.expect("SIGTERM diagnostic");
+        assert!(msg_term.contains("signal 15"));
+        assert!(msg_term.contains("SIGTERM"));
+        assert!(msg_term.contains("143"));
+
+        let status_fail = Command::new("/bin/sh")
+            .args(["-c", "exit 101"])
+            .status()
+            .await
+            .expect("run exit 101");
+        let (code_fail, msg_fail) = resolve_exit_status("cargo-clippy", status_fail);
+        assert_eq!(code_fail, 101);
+        assert_eq!(
+            msg_fail.as_deref(),
+            Some("Tool 'cargo-clippy' exited with status code 101")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_timeout_kills_process_group_before_pipe_eof_and_flushes_metrics() {
+        use mu_ci_ipc::decode_log_batch;
+
+        let dir = tempdir().unwrap();
+        let config = WorkerConfig {
+            controller_url: "ws://127.0.0.1:8000/api/cluster/tunnel".into(),
+            cluster_token: "test".into(),
+            node_id: "worker-riscv64".into(),
+            arch: "riscv64".into(),
+            tags: vec!["k3".into()],
+            max_slots: 1,
+            workspace_dir: dir.path().to_path_buf(),
+            toolchains: vec!["system".into()],
+            use_btrfs: false,
+            isolation_mode: IsolationMode::None,
+            rust_semver: None,
+        };
+        let runner = StageRunner::new(config);
+        let task = StageDispatchTask {
+            job_id: "job-timeout-pg".into(),
+            stage_id: "miri-check".into(),
+            stage_name: "Miri".into(),
+            repo_name: "LMA1980/mu-ci-worker".into(),
+            clone_url: "".into(),
+            commit_sha: "deadbeef".into(),
+            command: "".into(),
+            working_dir: None,
+            env_vars: vec![],
+            timeout_seconds: 1,
+            threads: 2,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+            tasks: vec![TypedTaskInvocation {
+                task_id: "miri-1".into(),
+                tool_name: "cargo-miri".into(),
+                args: vec!["test".into()],
+                working_dir: None,
+                env_vars: vec![],
+                sandbox: SandboxConstraintSpec::default(),
+                sccache_mode: Default::default(),
+            }],
+            sandbox_constraints: SandboxConstraintSpec::default(),
+            traceparent: None,
+            sccache_mode: Default::default(),
+        };
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "sleep 30 & gpid=$!; printf \"GPID=%s\\nrunning 2 tests\\ntest alpha::passes ... ok\\ntest beta::passes ... ok\\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\" \"$gpid\"; sleep 30",
+        ]);
+        cmd.process_group(0);
+
+        let adapter = mu_ci_tools::adapters::CargoMiriAdapter;
+        let inv = &task.tasks[0];
+        let argv = vec![OsString::from("/bin/sh")];
+        let (log_tx, mut log_rx) = mpsc::channel(32);
+        let mut started_tx = None;
+        let line_counter = Arc::new(AtomicU32::new(1));
+        let hw = HardwareProfile::detect(&runner.config, &task, Some(inv));
+        let mut trace_session =
+            StageTraceSession::from_dispatch_task(&task, &runner.config.node_id, &hw);
+        let mut cancel_rx = None;
+        let mut all_test_runs = Vec::new();
+        let mut all_bench_runs = Vec::new();
+
+        let started = std::time::Instant::now();
+        let outcome = runner
+            .execute_tool_process(
+                cmd,
+                &adapter,
+                &task,
+                inv,
+                &argv,
+                &log_tx,
+                &mut started_tx,
+                &line_counter,
+                &mut trace_session,
+                &mut cancel_rx,
+                &mut all_test_runs,
+                &mut all_bench_runs,
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Timeout must kill grandchild holding stdout open promptly, elapsed: {:?}",
+            elapsed
+        );
+        let (_, code, span_outcome, msg) = outcome.expect_err("command must time out");
+        assert_eq!(code, 124);
+        assert_eq!(span_outcome, StageSpanOutcome::TimedOut);
+        assert!(msg.contains("timed out after 1 seconds"));
+
+        // Verify partial test metrics were flushed on timeout (#75).
+        assert_eq!(all_test_runs.len(), 2);
+        assert_eq!(all_test_runs[0].test_name, "alpha::passes");
+        assert_eq!(all_test_runs[0].status, "ok");
+        assert_eq!(all_test_runs[1].test_name, "beta::passes");
+
+        // Verify buffered logs were drained and grandchild PID was terminated (#74, #75).
+        let mut logs = Vec::new();
+        while let Ok(batch) = log_rx.try_recv() {
+            logs.extend(decode_log_batch(&batch).expect("decode batch"));
+        }
+        let gpid_line = logs
+            .iter()
+            .find(|l| l.content.starts_with("GPID="))
+            .expect("GPID log line captured before timeout");
+        let gpid: i32 = gpid_line
+            .content
+            .trim_start_matches("GPID=")
+            .trim()
+            .parse()
+            .expect("numeric grandchild pid");
+        // Allow OS a brief moment to reap the killed grandchild if still transitioning.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let alive = unsafe { libc::kill(gpid, 0) };
+        assert_eq!(
+            alive, -1,
+            "Grandchild process {gpid} must be terminated when stage times out"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_prepare_stage_workspace_captures_git_stdio_without_inheriting_fds() {
+        use mu_ci_ipc::decode_log_batch;
+
+        let dir = tempdir().unwrap();
+        let origin_repo = dir.path().join("origin-repo");
+        std::fs::create_dir_all(&origin_repo).unwrap();
+
+        let run_git = |args: &[&str], cwd: &Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "CI")
+                .env("GIT_AUTHOR_EMAIL", "ci@example.com")
+                .env("GIT_COMMITTER_NAME", "CI")
+                .env("GIT_COMMITTER_EMAIL", "ci@example.com")
+                .current_dir(cwd)
+                .output()
+                .expect("run git setup");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run_git(&["init", "-b", "main"], &origin_repo);
+        std::fs::write(origin_repo.join("README.md"), "hello\n").unwrap();
+        run_git(&["add", "README.md"], &origin_repo);
+        let tree_out = run_git(&["write-tree"], &origin_repo);
+        let tree_sha = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
+        let commit_out = run_git(&["commit-tree", &tree_sha, "-m", "initial"], &origin_repo);
+        let commit_sha = String::from_utf8_lossy(&commit_out.stdout)
+            .trim()
+            .to_string();
+        run_git(
+            &["update-ref", "refs/heads/main", &commit_sha],
+            &origin_repo,
+        );
+        run_git(&["symbolic-ref", "HEAD", "refs/heads/main"], &origin_repo);
+
+        let ws_dir = dir.path().join("workspace");
+        let config = WorkerConfig {
+            controller_url: "ws://127.0.0.1:8000/api/cluster/tunnel".into(),
+            cluster_token: "test".into(),
+            node_id: "worker-node".into(),
+            arch: "x86_64".into(),
+            tags: vec![],
+            max_slots: 1,
+            workspace_dir: ws_dir,
+            toolchains: vec![],
+            use_btrfs: false,
+            isolation_mode: IsolationMode::None,
+            rust_semver: None,
+        };
+        let runner = StageRunner::new(config);
+        let task = StageDispatchTask {
+            job_id: "job-git-stdio".into(),
+            stage_id: "stage-git".into(),
+            stage_name: "Git Stdio".into(),
+            repo_name: "LMA1980/test-repo".into(),
+            clone_url: origin_repo.to_string_lossy().into_owned(),
+            commit_sha: commit_sha.clone(),
+            command: "".into(),
+            working_dir: None,
+            env_vars: vec![],
+            timeout_seconds: 15,
+            threads: 1,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+            tasks: vec![],
+            sandbox_constraints: SandboxConstraintSpec::default(),
+            traceparent: None,
+            sccache_mode: Default::default(),
+        };
+
+        let (log_tx, mut log_rx) = mpsc::channel(64);
+        let stage_dir = runner.prepare_stage_workspace(&task, &log_tx).await;
+        assert!(stage_dir.join("README.md").exists());
+
+        let mut captured_lines = Vec::new();
+        while let Ok(batch) = log_rx.try_recv() {
+            for entry in decode_log_batch(&batch).expect("decode git log batch") {
+                assert!(!entry.content.contains('\n') && !entry.content.contains('\r'));
+                captured_lines.push((entry.stream, entry.content));
+            }
+        }
+        assert!(
+            captured_lines
+                .iter()
+                .any(|(stream, line)| *stream == 2 && line.contains("Cloning into")),
+            "expected captured git clone stderr line in log_tx, got: {:?}",
+            captured_lines
+        );
+        assert!(
+            captured_lines
+                .iter()
+                .any(|(stream, line)| *stream == 2 && line.contains(&commit_sha[..7])),
+            "expected captured git checkout detached HEAD notice in log_tx, got: {:?}",
+            captured_lines
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_execute_tool_process_cancellation_kills_group_and_preserves_reason() {
+        let dir = tempdir().unwrap();
+        let config = WorkerConfig {
+            controller_url: "ws://127.0.0.1:8000/api/cluster/tunnel".into(),
+            cluster_token: "test".into(),
+            node_id: "worker-node".into(),
+            arch: "x86_64".into(),
+            tags: vec![],
+            max_slots: 1,
+            workspace_dir: dir.path().to_path_buf(),
+            toolchains: vec![],
+            use_btrfs: false,
+            isolation_mode: IsolationMode::None,
+            rust_semver: None,
+        };
+        let runner = StageRunner::new(config);
+        let task = StageDispatchTask {
+            job_id: "job-cancel-proc".into(),
+            stage_id: "test-check".into(),
+            stage_name: "Test".into(),
+            repo_name: "LMA1980/mu-ci-worker".into(),
+            clone_url: "".into(),
+            commit_sha: "deadbeef".into(),
+            command: "".into(),
+            working_dir: None,
+            env_vars: vec![],
+            timeout_seconds: 30,
+            threads: 1,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+            tasks: vec![TypedTaskInvocation {
+                task_id: "t1".into(),
+                tool_name: "cargo-test".into(),
+                args: vec!["--workspace".into()],
+                working_dir: None,
+                env_vars: vec![],
+                sandbox: SandboxConstraintSpec::default(),
+                sccache_mode: Default::default(),
+            }],
+            sandbox_constraints: SandboxConstraintSpec::default(),
+            traceparent: None,
+            sccache_mode: Default::default(),
+        };
+
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30");
+        cmd.process_group(0);
+
+        let adapter = mu_ci_tools::adapters::CargoTestAdapter;
+        let inv = &task.tasks[0];
+        let argv = vec![OsString::from("/bin/sleep"), OsString::from("30")];
+        let (log_tx, _log_rx) = mpsc::channel(16);
+        let (started_tx_inner, started_rx) = tokio::sync::oneshot::channel();
+        let mut started_tx = Some(started_tx_inner);
+        let line_counter = Arc::new(AtomicU32::new(1));
+        let hw = HardwareProfile::detect(&runner.config, &task, Some(inv));
+        let mut trace_session =
+            StageTraceSession::from_dispatch_task(&task, &runner.config.node_id, &hw);
+        let (cancel_tx, cancel_rx_inner) = tokio::sync::watch::channel::<Option<String>>(None);
+        let mut cancel_rx = Some(cancel_rx_inner);
+        let mut all_test_runs = Vec::new();
+        let mut all_bench_runs = Vec::new();
+
+        tokio::spawn(async move {
+            if started_rx.await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let _ = cancel_tx.send(Some("Superseded by newer push".to_string()));
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let res = runner
+            .execute_tool_process(
+                cmd,
+                &adapter,
+                &task,
+                inv,
+                &argv,
+                &log_tx,
+                &mut started_tx,
+                &line_counter,
+                &mut trace_session,
+                &mut cancel_rx,
+                &mut all_test_runs,
+                &mut all_bench_runs,
+            )
+            .await;
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let (_, code, outcome, msg) = res.expect_err("cancelled process must return Err");
+        assert_eq!(code, 130);
+        assert_eq!(outcome, StageSpanOutcome::Cancelled);
+        assert_eq!(msg, "Stage cancelled: Superseded by newer push");
     }
 }
