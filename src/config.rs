@@ -35,10 +35,7 @@ impl WorkerConfig {
         let arch = std::env::var("ACTION_RUNNER_ARCH")
             .unwrap_or_else(|_| std::env::consts::ARCH.to_string());
 
-        let default_tags = match arch.as_str() {
-            "riscv64" => "riscv64,native,k3,rvv,ime,bench",
-            _ => "x86_64,fmt,clippy,audit,cross,heavy",
-        };
+        let default_tags = default_tags_for_arch(&arch);
 
         let mut tags: Vec<String> = std::env::var("ACTION_RUNNER_TAGS")
             .unwrap_or_else(|_| default_tags.to_string())
@@ -143,6 +140,42 @@ impl WorkerConfig {
             })
             .unwrap_or(default_threads)
             .max(1)
+    }
+
+    /// Pure evaluation of whether `tool_name` is disabled for a worker `arch` and optional
+    /// `ACTION_RUNNER_DISABLED_TOOLS` override.
+    ///
+    /// By default (`disabled_env == None`), `cargo-miri` is disabled on ARM workers
+    /// (`aarch64` / `arm*`). Setting `ACTION_RUNNER_DISABLED_TOOLS` to `"none"` / `"off"` / `"false"`
+    /// clears the default denylist; setting a comma-separated list disables each listed tool.
+    #[must_use]
+    pub fn is_tool_disabled_for(arch: &str, tool_name: &str, disabled_env: Option<&str>) -> bool {
+        let tool = tool_name.trim();
+        if tool.is_empty() {
+            return false;
+        }
+        match disabled_env.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw)
+                if matches!(
+                    raw.to_ascii_lowercase().as_str(),
+                    "none" | "off" | "false" | "0"
+                ) =>
+            {
+                false
+            }
+            Some(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .any(|t| t.eq_ignore_ascii_case(tool)),
+            None => is_arm_arch(arch) && tool.eq_ignore_ascii_case("cargo-miri"),
+        }
+    }
+
+    #[must_use]
+    pub fn is_tool_disabled(&self, tool_name: &str) -> bool {
+        let env_val = std::env::var("ACTION_RUNNER_DISABLED_TOOLS").ok();
+        Self::is_tool_disabled_for(&self.arch, tool_name, env_val.as_deref())
     }
 
     fn detect_btrfs(path: &Path) -> bool {
@@ -576,6 +609,27 @@ fn is_valid_semver(version: &str) -> bool {
         && is_valid_numeric_component(patch)
 }
 
+/// Returns `true` when a worker architecture string identifies an ARM (`aarch64` / `arm*`) host.
+#[must_use]
+pub fn is_arm_arch(arch: &str) -> bool {
+    let lower = arch.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "aarch64" | "arm64" | "arm")
+        || lower.starts_with("aarch64-")
+        || lower.starts_with("arm-")
+        || lower.starts_with("armv")
+}
+
+/// Returns the default `ACTION_RUNNER_TAGS` string for a worker architecture when
+/// `ACTION_RUNNER_TAGS` is unset.
+#[must_use]
+pub fn default_tags_for_arch(arch: &str) -> &'static str {
+    match arch.trim() {
+        "riscv64" | "riscv64gc" => "riscv64,native,k3,rvv,ime,bench",
+        a if is_arm_arch(a) => "aarch64,arm64",
+        _ => "x86_64,fmt,clippy,audit,cross,heavy",
+    }
+}
+
 pub fn is_safe_repo_name(repo: &str) -> bool {
     let parts: Vec<&str> = repo.split('/').collect();
     if parts.len() != 2 {
@@ -941,6 +995,80 @@ mod tests {
                 is_valid_semver(&semver),
                 "Detected rustc semver must be valid semver: {semver}"
             );
+        }
+    }
+
+    #[test]
+    fn test_arm_default_tags_and_tool_denylist_under_miri() {
+        assert!(is_arm_arch("aarch64"));
+        assert!(is_arm_arch("arm64"));
+        assert!(is_arm_arch("armv7l"));
+        assert!(is_arm_arch("aarch64-unknown-linux-gnu"));
+        assert!(!is_arm_arch("x86_64"));
+        assert!(!is_arm_arch("riscv64"));
+
+        assert_eq!(default_tags_for_arch("aarch64"), "aarch64,arm64");
+        assert_eq!(default_tags_for_arch("arm64"), "aarch64,arm64");
+        assert_eq!(
+            default_tags_for_arch("riscv64"),
+            "riscv64,native,k3,rvv,ime,bench"
+        );
+        assert_eq!(
+            default_tags_for_arch("x86_64"),
+            "x86_64,fmt,clippy,audit,cross,heavy"
+        );
+
+        // Default denylist disables cargo-miri on ARM workers only.
+        assert!(WorkerConfig::is_tool_disabled_for(
+            "aarch64",
+            "cargo-miri",
+            None
+        ));
+        assert!(WorkerConfig::is_tool_disabled_for(
+            "arm64",
+            "CARGO-MIRI",
+            None
+        ));
+        assert!(!WorkerConfig::is_tool_disabled_for(
+            "aarch64",
+            "cargo-test",
+            None
+        ));
+        assert!(!WorkerConfig::is_tool_disabled_for(
+            "x86_64",
+            "cargo-miri",
+            None
+        ));
+        assert!(!WorkerConfig::is_tool_disabled_for(
+            "riscv64",
+            "cargo-miri",
+            None
+        ));
+
+        // Explicit ACTION_RUNNER_DISABLED_TOOLS list overrides default behavior.
+        assert!(WorkerConfig::is_tool_disabled_for(
+            "x86_64",
+            "cargo-miri",
+            Some("cargo-miri,cargo-bench")
+        ));
+        assert!(WorkerConfig::is_tool_disabled_for(
+            "x86_64",
+            "cargo-bench",
+            Some("cargo-miri, cargo-bench")
+        ));
+        assert!(!WorkerConfig::is_tool_disabled_for(
+            "aarch64",
+            "cargo-miri",
+            Some("cargo-bench")
+        ));
+
+        // Explicit opt-out clears the default denylist.
+        for opt_out in ["none", "off", "false", "0"] {
+            assert!(!WorkerConfig::is_tool_disabled_for(
+                "aarch64",
+                "cargo-miri",
+                Some(opt_out)
+            ));
         }
     }
 }

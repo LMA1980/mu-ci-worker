@@ -716,6 +716,29 @@ impl StageRunner {
             }
         }
 
+        if let Some(blocked_inv) = task
+            .tasks
+            .iter()
+            .find(|inv| self.config.is_tool_disabled(&inv.tool_name))
+        {
+            let err_msg = format!(
+                "Stage execution rejected: tool '{}' in task '{}' is disabled on worker '{}' (arch '{}')",
+                blocked_inv.tool_name,
+                blocked_inv.task_id,
+                self.config.node_id,
+                self.config.arch
+            );
+            error!("{}", err_msg);
+            let res = StageExecutionResult::failed_early(&trace_session, 126, 0, 0, err_msg, None);
+            if let Some(span) = &res.child_span {
+                let _ = self
+                    .telemetry_emitter
+                    .emit_stage_bundle(std::slice::from_ref(span), &[], &[], &[])
+                    .await;
+            }
+            return res;
+        }
+
         if let Some(reason) = current_cancel_reason(&cancel_rx) {
             let err_msg = format!("Stage cancelled: {reason}");
             let res = StageExecutionResult::failed_early(&trace_session, 130, 0, 0, err_msg, None);
@@ -3662,5 +3685,68 @@ allow_spacemit_ai_thread: false
         assert_eq!(code, 130);
         assert_eq!(outcome, StageSpanOutcome::Cancelled);
         assert_eq!(msg, "Stage cancelled: Superseded by newer push");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_run_stage_rejects_cargo_miri_on_arm_worker_without_cloning() {
+        let dir = tempdir().unwrap();
+        let ws_dir = dir.path().join("workspace-never-created");
+        let config = WorkerConfig {
+            controller_url: "ws://127.0.0.1:8000/api/cluster/tunnel".into(),
+            cluster_token: "test".into(),
+            node_id: "worker-aarch64".into(),
+            arch: "aarch64".into(),
+            tags: vec!["aarch64".into(), "arm64".into()],
+            max_slots: 1,
+            workspace_dir: ws_dir.clone(),
+            toolchains: vec!["system".into()],
+            use_btrfs: false,
+            isolation_mode: IsolationMode::None,
+            rust_semver: None,
+        };
+        let runner = StageRunner::new(config);
+        let task = StageDispatchTask {
+            job_id: "job-arm-miri-deny".into(),
+            stage_id: "miri-check".into(),
+            stage_name: "Miri Check".into(),
+            repo_name: "LMA1980/mu-ci-worker".into(),
+            clone_url: "https://example.invalid/repo.git".into(),
+            commit_sha: "deadbeef".into(),
+            command: "".into(),
+            working_dir: None,
+            env_vars: vec![],
+            timeout_seconds: 60,
+            threads: 2,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+            tasks: vec![TypedTaskInvocation {
+                task_id: "miri-task".into(),
+                tool_name: "cargo-miri".into(),
+                args: vec!["test".into(), "--workspace".into(), "--lib".into()],
+                working_dir: None,
+                env_vars: vec![],
+                sandbox: SandboxConstraintSpec::default(),
+                sccache_mode: Default::default(),
+            }],
+            sandbox_constraints: SandboxConstraintSpec::default(),
+            traceparent: None,
+            sccache_mode: Default::default(),
+        };
+
+        let (log_tx, _log_rx) = mpsc::channel(8);
+        let res = runner.run_stage(&task, log_tx, None).await;
+        assert_eq!(res.exit_code, 126);
+        let msg = res
+            .error_message
+            .as_deref()
+            .expect("rejected stage must include error_message");
+        assert!(msg.contains("cargo-miri"), "unexpected message: {msg}");
+        assert!(msg.contains("disabled"), "unexpected message: {msg}");
+        assert!(
+            !ws_dir.exists(),
+            "disabled tool must be rejected before workspace creation"
+        );
     }
 }
