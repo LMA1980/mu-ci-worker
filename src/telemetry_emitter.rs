@@ -168,14 +168,36 @@ impl HardwareProfile {
 
         // Check environment overrides in task or invocation first
         let env_cluster = inv
-            .and_then(|i| find_env(&i.env_vars, "ACTION_RUNNER_CPU_CLUSTER"))
-            .or_else(|| find_env(&task.env_vars, "ACTION_RUNNER_CPU_CLUSTER"))
-            .or_else(|| std::env::var("ACTION_RUNNER_CPU_CLUSTER").ok());
+            .and_then(|i| {
+                find_env(&i.env_vars, "MU_CI_WORKER_CPU_CLUSTER")
+                    .or_else(|| find_env(&i.env_vars, "ACTION_RUNNER_CPU_CLUSTER"))
+            })
+            .or_else(|| {
+                find_env(&task.env_vars, "MU_CI_WORKER_CPU_CLUSTER")
+                    .or_else(|| find_env(&task.env_vars, "ACTION_RUNNER_CPU_CLUSTER"))
+            })
+            .or_else(|| {
+                crate::config::first_non_empty_env(&[
+                    "MU_CI_WORKER_CPU_CLUSTER",
+                    "ACTION_RUNNER_CPU_CLUSTER",
+                ])
+            });
 
         let env_vlen = inv
-            .and_then(|i| find_env(&i.env_vars, "ACTION_RUNNER_VLEN_BITS"))
-            .or_else(|| find_env(&task.env_vars, "ACTION_RUNNER_VLEN_BITS"))
-            .or_else(|| std::env::var("ACTION_RUNNER_VLEN_BITS").ok())
+            .and_then(|i| {
+                find_env(&i.env_vars, "MU_CI_WORKER_VLEN_BITS")
+                    .or_else(|| find_env(&i.env_vars, "ACTION_RUNNER_VLEN_BITS"))
+            })
+            .or_else(|| {
+                find_env(&task.env_vars, "MU_CI_WORKER_VLEN_BITS")
+                    .or_else(|| find_env(&task.env_vars, "ACTION_RUNNER_VLEN_BITS"))
+            })
+            .or_else(|| {
+                crate::config::first_non_empty_env(&[
+                    "MU_CI_WORKER_VLEN_BITS",
+                    "ACTION_RUNNER_VLEN_BITS",
+                ])
+            })
             .and_then(|s| s.trim().parse::<u32>().ok());
 
         let require_ai_thread = inv

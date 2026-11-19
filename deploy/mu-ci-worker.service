@@ -1,0 +1,32 @@
+[Unit]
+Description=Mu-CI Distributed Execution Worker Daemon
+Documentation=https://github.com/LMA1980/mu-ci-worker
+After=network.target
+
+[Service]
+Type=simple
+User=mu-ci-worker
+Group=mu-ci-worker
+WorkingDirectory=/var/lib/mu-ci-worker
+EnvironmentFile=/etc/mu-ci-worker/worker.env
+EnvironmentFile=-/etc/mu-ci-worker/sccache.env
+Environment=RUSTUP_HOME=/var/lib/mu-ci-worker/.rustup
+Environment=CARGO_HOME=/var/lib/mu-ci-worker/.cargo
+Environment=PATH=/var/lib/mu-ci-worker/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/mu-ci-worker
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+ReadWritePaths=/var/lib/mu-ci-worker
+InaccessiblePaths=/etc/shadow /root
+
+[Install]
+WantedBy=multi-user.target

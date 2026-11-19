@@ -635,23 +635,20 @@ impl StageRunner {
         let mut trace_session =
             StageTraceSession::from_dispatch_task(task, &self.config.node_id, &stage_hardware);
         let node_thread_limit = self.config.max_threads();
-        let build_jobs = std::env::var("ACTION_RUNNER_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .or_else(|| {
-                std::env::var("CARGO_BUILD_JOBS")
-                    .ok()
-                    .and_then(|s| s.parse::<u32>().ok())
-            })
-            .unwrap_or_else(|| {
-                if task.threads > 0 {
-                    task.threads.min(node_thread_limit)
-                } else {
-                    node_thread_limit
-                }
-            })
-            .min(node_thread_limit)
-            .max(1);
+        let build_jobs = crate::config::first_parsed_env::<u32>(&[
+            "MU_CI_WORKER_THREADS",
+            "ACTION_RUNNER_THREADS",
+            "CARGO_BUILD_JOBS",
+        ])
+        .unwrap_or_else(|| {
+            if task.threads > 0 {
+                task.threads.min(node_thread_limit)
+            } else {
+                node_thread_limit
+            }
+        })
+        .min(node_thread_limit)
+        .max(1);
 
         info!(
             job_id = %task.job_id,
@@ -1418,6 +1415,7 @@ impl StageRunner {
 
             // Environment Setup
             cmd.env("CI", "true");
+            cmd.env("MU_CI", "true");
             cmd.env("ACTION_RUNNER", "true");
             cmd.env("JOB_ID", &task.job_id);
             cmd.env("STAGE_ID", &task.stage_id);
