@@ -22,41 +22,155 @@ pub enum IsolationMode {
     SystemdRun,
 }
 
+/// Returns the first non-empty trimmed value among `vars` using a custom env lookup.
+pub(crate) fn first_non_empty_in<F>(vars: &[&str], get_env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    for var in vars {
+        if let Some(val) = get_env(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parses the first valid value of `T` among `vars` using a custom env lookup.
+pub(crate) fn first_parsed_in<T, F>(vars: &[&str], get_env: &F) -> Option<T>
+where
+    T: std::str::FromStr,
+    F: Fn(&str) -> Option<String>,
+{
+    for var in vars {
+        if let Some(val) = get_env(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                if let Ok(parsed) = trimmed.parse::<T>() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns the first non-empty trimmed value among `vars`.
+pub(crate) fn first_non_empty_env(vars: &[&str]) -> Option<String> {
+    first_non_empty_in(vars, &|k| std::env::var(k).ok())
+}
+
+/// Parses the first valid value of `T` among `vars`.
+pub(crate) fn first_parsed_env<T: std::str::FromStr>(vars: &[&str]) -> Option<T> {
+    first_parsed_in(vars, &|k| std::env::var(k).ok())
+}
+
 impl WorkerConfig {
+    /// Resolve the default workspace directory, preferring the canonical `mu-ci-worker` root
+    /// when present on disk, falling back to the legacy `action-runner` root if only it exists,
+    /// and otherwise defaulting to `mu_root/workspace`.
+    #[must_use]
+    pub fn resolve_default_workspace_dir(mu_root: &Path, legacy_root: &Path) -> PathBuf {
+        if mu_root.is_dir() {
+            mu_root.join("workspace")
+        } else if legacy_root.is_dir() {
+            legacy_root.join("workspace")
+        } else {
+            mu_root.join("workspace")
+        }
+    }
+
+    /// Resolve the `sccache` environment file path, honoring an explicit override first,
+    /// then `mu_path`, then `legacy_path`, defaulting to `mu_path` when neither exists on disk.
+    #[must_use]
+    pub fn resolve_sccache_env_file_from(
+        explicit: Option<&str>,
+        mu_path: &Path,
+        legacy_path: &Path,
+    ) -> PathBuf {
+        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            return PathBuf::from(raw);
+        }
+        if mu_path.is_file() {
+            return mu_path.to_path_buf();
+        }
+        if legacy_path.is_file() {
+            return legacy_path.to_path_buf();
+        }
+        mu_path.to_path_buf()
+    }
+
     pub fn load() -> Self {
-        let controller_url = std::env::var("ACTION_RUNNER_CONTROLLER_URL")
-            .unwrap_or_else(|_| "ws://127.0.0.1:8000/api/cluster/tunnel".to_string());
+        Self::load_with_env(|k| std::env::var(k).ok())
+    }
 
-        let cluster_token = Self::resolve_secret("ACTION_RUNNER_CLUSTER_TOKEN")
-            .unwrap_or_else(|| "action-runner-default-cluster-token".to_string());
+    pub fn load_with_env<F>(get_env: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let controller_url = first_non_empty_in(
+            &[
+                "MU_CI_WORKER_CONTROLLER_URL",
+                "ACTION_RUNNER_CONTROLLER_URL",
+            ],
+            &get_env,
+        )
+        .unwrap_or_else(|| "ws://127.0.0.1:8000/api/cluster/tunnel".to_string());
 
-        let node_id = std::env::var("ACTION_RUNNER_NODE_ID").unwrap_or_else(|_| hostname());
+        let cluster_token = Self::resolve_secret_first_with_env(
+            &["MU_CI_WORKER_CLUSTER_TOKEN", "ACTION_RUNNER_CLUSTER_TOKEN"],
+            &get_env,
+        )
+        .unwrap_or_else(|| "action-runner-default-cluster-token".to_string());
 
-        let arch = std::env::var("ACTION_RUNNER_ARCH")
-            .unwrap_or_else(|_| std::env::consts::ARCH.to_string());
+        let node_id =
+            first_non_empty_in(&["MU_CI_WORKER_NODE_ID", "ACTION_RUNNER_NODE_ID"], &get_env)
+                .unwrap_or_else(hostname);
+
+        let arch = first_non_empty_in(&["MU_CI_WORKER_ARCH", "ACTION_RUNNER_ARCH"], &get_env)
+            .unwrap_or_else(|| std::env::consts::ARCH.to_string());
 
         let default_tags = default_tags_for_arch(&arch);
 
-        let mut tags: Vec<String> = std::env::var("ACTION_RUNNER_TAGS")
-            .unwrap_or_else(|_| default_tags.to_string())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let mut tags: Vec<String> =
+            first_non_empty_in(&["MU_CI_WORKER_TAGS", "ACTION_RUNNER_TAGS"], &get_env)
+                .unwrap_or_else(|| default_tags.to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
 
-        if Self::detect_sccache_bin().is_some() && !tags.iter().any(|t| t == "sccache") {
+        if Self::detect_sccache_bin_with_env(&get_env).is_some()
+            && !tags.iter().any(|t| t == "sccache")
+        {
             tags.push("sccache".to_string());
         }
 
-        let max_slots = std::env::var("ACTION_RUNNER_MAX_SLOTS")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(1)
-            .max(1);
+        let max_slots = first_parsed_in::<u32, _>(
+            &[
+                "MU_CI_WORKER_MAX_SLOTS",
+                "MU_CI_WORKER_SLOTS",
+                "ACTION_RUNNER_MAX_SLOTS",
+                "ACTION_RUNNER_SLOTS",
+            ],
+            &get_env,
+        )
+        .unwrap_or(1)
+        .max(1);
 
-        let workspace_dir = std::env::var("ACTION_RUNNER_WORKSPACE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/var/lib/action-runner/workspace"));
+        let workspace_dir = first_non_empty_in(
+            &["MU_CI_WORKER_WORKSPACE", "ACTION_RUNNER_WORKSPACE"],
+            &get_env,
+        )
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Self::resolve_default_workspace_dir(
+                Path::new("/var/lib/mu-ci-worker"),
+                Path::new("/var/lib/action-runner"),
+            )
+        });
 
         let mut toolchains = vec!["system".to_string()];
         if Path::new("/opt/llvm-24-spacemit-x100/bin/clang").exists()
@@ -77,20 +191,26 @@ impl WorkerConfig {
             toolchains.push("gcc-17".to_string());
         }
 
-        let use_btrfs = std::env::var("ACTION_RUNNER_USE_BTRFS")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or_else(|_| Self::detect_btrfs(&workspace_dir));
+        let use_btrfs = first_non_empty_in(
+            &["MU_CI_WORKER_USE_BTRFS", "ACTION_RUNNER_USE_BTRFS"],
+            &get_env,
+        )
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or_else(|| Self::detect_btrfs(&workspace_dir));
 
-        let isolation_mode = match std::env::var("ACTION_RUNNER_ISOLATION")
-            .unwrap_or_else(|_| "none".to_string())
-            .to_ascii_lowercase()
-            .as_str()
+        let isolation_mode = match first_non_empty_in(
+            &["MU_CI_WORKER_ISOLATION", "ACTION_RUNNER_ISOLATION"],
+            &get_env,
+        )
+        .unwrap_or_else(|| "none".to_string())
+        .to_ascii_lowercase()
+        .as_str()
         {
             "systemd-run" => IsolationMode::SystemdRun,
             _ => IsolationMode::None,
         };
 
-        let rust_semver = Self::probe_rustc_semver();
+        let rust_semver = Self::probe_rustc_semver_with_env(&get_env);
 
         let cfg = Self {
             controller_url,
@@ -110,18 +230,25 @@ impl WorkerConfig {
             node_id = %cfg.node_id,
             arch = %cfg.arch,
             max_slots = cfg.max_slots,
-            max_threads = cfg.max_threads(),
+            max_threads = cfg.max_threads_with_env(&get_env),
             tags = ?cfg.tags,
             toolchains = ?cfg.toolchains,
             rust_semver = ?cfg.rust_semver,
             btrfs = cfg.use_btrfs,
-            "Loaded ActionRunner worker configuration"
+            "Loaded mu-ci-worker configuration"
         );
 
         cfg
     }
 
     pub fn max_threads(&self) -> u32 {
+        self.max_threads_with_env(|k| std::env::var(k).ok())
+    }
+
+    pub fn max_threads_with_env<F>(&self, get_env: F) -> u32
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let default_threads = if self.node_id.eq_ignore_ascii_case("node-a")
             || self.tags.iter().any(|t| t.eq_ignore_ascii_case("n100"))
         {
@@ -130,23 +257,23 @@ impl WorkerConfig {
             6
         };
 
-        std::env::var("ACTION_RUNNER_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .or_else(|| {
-                std::env::var("CARGO_BUILD_JOBS")
-                    .ok()
-                    .and_then(|s| s.parse::<u32>().ok())
-            })
-            .unwrap_or(default_threads)
-            .max(1)
+        first_parsed_in::<u32, _>(
+            &[
+                "MU_CI_WORKER_THREADS",
+                "ACTION_RUNNER_THREADS",
+                "CARGO_BUILD_JOBS",
+            ],
+            &get_env,
+        )
+        .unwrap_or(default_threads)
+        .max(1)
     }
 
     /// Pure evaluation of whether `tool_name` is disabled for a worker `arch` and optional
-    /// `ACTION_RUNNER_DISABLED_TOOLS` override.
+    /// `MU_CI_WORKER_DISABLED_TOOLS` / `ACTION_RUNNER_DISABLED_TOOLS` override.
     ///
     /// By default (`disabled_env == None`), `cargo-miri` is disabled on ARM workers
-    /// (`aarch64` / `arm*`). Setting `ACTION_RUNNER_DISABLED_TOOLS` to `"none"` / `"off"` / `"false"`
+    /// (`aarch64` / `arm*`). Setting the override to `"none"` / `"off"` / `"false"`
     /// clears the default denylist; setting a comma-separated list disables each listed tool.
     #[must_use]
     pub fn is_tool_disabled_for(arch: &str, tool_name: &str, disabled_env: Option<&str>) -> bool {
@@ -174,7 +301,21 @@ impl WorkerConfig {
 
     #[must_use]
     pub fn is_tool_disabled(&self, tool_name: &str) -> bool {
-        let env_val = std::env::var("ACTION_RUNNER_DISABLED_TOOLS").ok();
+        self.is_tool_disabled_with_env(tool_name, |k| std::env::var(k).ok())
+    }
+
+    #[must_use]
+    pub fn is_tool_disabled_with_env<F>(&self, tool_name: &str, get_env: F) -> bool
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let env_val = first_non_empty_in(
+            &[
+                "MU_CI_WORKER_DISABLED_TOOLS",
+                "ACTION_RUNNER_DISABLED_TOOLS",
+            ],
+            &get_env,
+        );
         Self::is_tool_disabled_for(&self.arch, tool_name, env_val.as_deref())
     }
 
@@ -196,8 +337,17 @@ impl WorkerConfig {
     }
 
     pub fn detect_sccache_bin() -> Option<PathBuf> {
-        if let Ok(val) = std::env::var("ACTION_RUNNER_SCCACHE_BIN") {
-            let trimmed = val.trim();
+        Self::detect_sccache_bin_with_env(|k| std::env::var(k).ok())
+    }
+
+    pub fn detect_sccache_bin_with_env<F>(get_env: F) -> Option<PathBuf>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if let Some(trimmed) = first_non_empty_in(
+            &["MU_CI_WORKER_SCCACHE_BIN", "ACTION_RUNNER_SCCACHE_BIN"],
+            &get_env,
+        ) {
             if trimmed.eq_ignore_ascii_case("false")
                 || trimmed.eq_ignore_ascii_case("off")
                 || trimmed.eq_ignore_ascii_case("none")
@@ -205,13 +355,11 @@ impl WorkerConfig {
             {
                 return None;
             }
-            if !trimmed.is_empty() {
-                let p = PathBuf::from(trimmed);
-                if p.is_file() {
-                    return Some(p);
-                }
-                return None;
+            let p = PathBuf::from(trimmed);
+            if p.is_file() {
+                return Some(p);
             }
+            return None;
         }
 
         for candidate in ["/usr/local/bin/sccache", "/usr/bin/sccache"] {
@@ -221,13 +369,13 @@ impl WorkerConfig {
             }
         }
 
-        if let Ok(home) = std::env::var("CARGO_HOME") {
+        if let Some(home) = get_env("CARGO_HOME") {
             let p = Path::new(&home).join("bin/sccache");
             if p.is_file() {
                 return Some(p);
             }
         }
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = get_env("HOME") {
             let p = Path::new(&home).join(".cargo/bin/sccache");
             if p.is_file() {
                 return Some(p);
@@ -237,9 +385,26 @@ impl WorkerConfig {
     }
 
     pub fn load_sccache_env() -> Vec<(String, String)> {
+        Self::load_sccache_env_with_env(|k| std::env::var(k).ok())
+    }
+
+    pub fn load_sccache_env_with_env<F>(get_env: F) -> Vec<(String, String)>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let mut envs = Vec::new();
-        let env_file = std::env::var("ACTION_RUNNER_SCCACHE_ENV_FILE")
-            .unwrap_or_else(|_| "/etc/action-runner/sccache.env".to_string());
+        let explicit = first_non_empty_in(
+            &[
+                "MU_CI_WORKER_SCCACHE_ENV_FILE",
+                "ACTION_RUNNER_SCCACHE_ENV_FILE",
+            ],
+            &get_env,
+        );
+        let env_file = Self::resolve_sccache_env_file_from(
+            explicit.as_deref(),
+            Path::new("/etc/mu-ci-worker/sccache.env"),
+            Path::new("/etc/action-runner/sccache.env"),
+        );
         if let Ok(content) = std::fs::read_to_string(&env_file) {
             for line in content.lines() {
                 let trimmed = line.trim();
@@ -272,7 +437,7 @@ impl WorkerConfig {
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
         ] {
-            if let Ok(val) = std::env::var(key) {
+            if let Some(val) = get_env(key) {
                 if !val.trim().is_empty() {
                     if let Some(pos) = envs.iter().position(|(k, _)| k == key) {
                         envs[pos].1 = val;
@@ -288,6 +453,26 @@ impl WorkerConfig {
     pub fn resolve_secret(env_var: &str) -> Option<String> {
         let val = std::env::var(env_var).ok()?;
         Self::resolve_secret_value(&val)
+    }
+
+    /// Resolve a secret from the first non-empty environment variable in `vars`.
+    /// Fails closed (`None`) if the selected variable points to an unreadable or empty path.
+    pub fn resolve_secret_first(vars: &[&str]) -> Option<String> {
+        Self::resolve_secret_first_with_env(vars, |k| std::env::var(k).ok())
+    }
+
+    pub fn resolve_secret_first_with_env<F>(vars: &[&str], get_env: F) -> Option<String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        for var in vars {
+            if let Some(val) = get_env(var) {
+                if !val.trim().is_empty() {
+                    return Self::resolve_secret_value(&val);
+                }
+            }
+        }
+        None
     }
 
     pub fn resolve_secret_value(val: &str) -> Option<String> {
@@ -331,14 +516,36 @@ impl WorkerConfig {
         }
     }
 
-    /// Resolve the `rustc` binary path while honoring `ACTION_RUNNER_RUSTC_BIN`,
-    /// `CARGO_HOME`, `PATH`, `RUSTUP_HOME`, `HOME`, and the service-account fallback.
+    /// Resolve the `rustc` binary path while honoring `MU_CI_WORKER_RUSTC_BIN` /
+    /// `ACTION_RUNNER_RUSTC_BIN`, `CARGO_HOME`, `PATH`, `RUSTUP_HOME`, `HOME`,
+    /// and service-account fallbacks (`/var/lib/mu-ci-worker`, `/var/lib/action-runner`).
     pub fn resolve_rustc_bin_from(
         explicit_bin: Option<&Path>,
         cargo_home: Option<&Path>,
         rustup_home: Option<&Path>,
         path_env: Option<&std::ffi::OsStr>,
         home: Option<&Path>,
+    ) -> PathBuf {
+        Self::resolve_rustc_bin_from_roots(
+            explicit_bin,
+            cargo_home,
+            rustup_home,
+            path_env,
+            home,
+            &[
+                Path::new("/var/lib/mu-ci-worker"),
+                Path::new("/var/lib/action-runner"),
+            ],
+        )
+    }
+
+    pub(crate) fn resolve_rustc_bin_from_roots(
+        explicit_bin: Option<&Path>,
+        cargo_home: Option<&Path>,
+        rustup_home: Option<&Path>,
+        path_env: Option<&std::ffi::OsStr>,
+        home: Option<&Path>,
+        service_roots: &[&Path],
     ) -> PathBuf {
         if let Some(explicit) = explicit_bin.filter(|p| !p.as_os_str().is_empty()) {
             return explicit.to_path_buf();
@@ -376,21 +583,63 @@ impl WorkerConfig {
             }
         }
 
-        let service_candidate = Path::new("/var/lib/action-runner/.cargo/bin/rustc");
-        if service_candidate.is_file() {
-            return service_candidate.to_path_buf();
+        for root in service_roots {
+            let service_candidate = root.join(".cargo").join("bin").join("rustc");
+            if service_candidate.is_file() {
+                return service_candidate;
+            }
         }
 
         PathBuf::from("rustc")
     }
 
+    pub(crate) fn infer_service_toolchain_homes(
+        rustc_bin: &Path,
+        rustup_home: Option<PathBuf>,
+        cargo_home: Option<PathBuf>,
+        service_roots: &[&Path],
+    ) -> (Option<PathBuf>, Option<PathBuf>) {
+        let effective_rustup_home = rustup_home.or_else(|| {
+            service_roots.iter().find_map(|root| {
+                let rustup = root.join(".rustup");
+                if rustc_bin.starts_with(root) && rustup.is_dir() {
+                    Some(rustup)
+                } else {
+                    None
+                }
+            })
+        });
+        let effective_cargo_home = cargo_home.or_else(|| {
+            service_roots.iter().find_map(|root| {
+                let cargo = root.join(".cargo");
+                if rustc_bin.starts_with(root) && cargo.is_dir() {
+                    Some(cargo)
+                } else {
+                    None
+                }
+            })
+        });
+        (effective_rustup_home, effective_cargo_home)
+    }
+
     /// Detect the `rustc` binary using the current process environment.
     pub fn detect_rustc_bin() -> PathBuf {
-        let explicit = std::env::var_os("ACTION_RUNNER_RUSTC_BIN").map(PathBuf::from);
-        let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
-        let rustup_home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from);
-        let path_env = std::env::var_os("PATH");
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self::detect_rustc_bin_with_env(|k| std::env::var(k).ok())
+    }
+
+    pub fn detect_rustc_bin_with_env<F>(get_env: F) -> PathBuf
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let explicit = first_non_empty_in(
+            &["MU_CI_WORKER_RUSTC_BIN", "ACTION_RUNNER_RUSTC_BIN"],
+            &get_env,
+        )
+        .map(PathBuf::from);
+        let cargo_home = get_env("CARGO_HOME").map(PathBuf::from);
+        let rustup_home = get_env("RUSTUP_HOME").map(PathBuf::from);
+        let path_env = get_env("PATH").map(std::ffi::OsString::from);
+        let home = get_env("HOME").map(PathBuf::from);
         Self::resolve_rustc_bin_from(
             explicit.as_deref(),
             cargo_home.as_deref(),
@@ -421,15 +670,26 @@ impl WorkerConfig {
     ///
     /// Fails soft (`None`) with a warning log if `rustc` cannot be executed or parsed.
     pub fn probe_rustc_semver() -> Option<String> {
-        let explicit = std::env::var_os("ACTION_RUNNER_RUSTC_BIN").map(PathBuf::from);
-        let cargo_home = std::env::var_os("CARGO_HOME")
+        Self::probe_rustc_semver_with_env(|k| std::env::var(k).ok())
+    }
+
+    pub fn probe_rustc_semver_with_env<F>(get_env: F) -> Option<String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let explicit = first_non_empty_in(
+            &["MU_CI_WORKER_RUSTC_BIN", "ACTION_RUNNER_RUSTC_BIN"],
+            &get_env,
+        )
+        .map(PathBuf::from);
+        let cargo_home = get_env("CARGO_HOME")
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty());
-        let rustup_home = std::env::var_os("RUSTUP_HOME")
+        let rustup_home = get_env("RUSTUP_HOME")
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty());
-        let path_env = std::env::var_os("PATH");
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let path_env = get_env("PATH").map(std::ffi::OsString::from);
+        let home = get_env("HOME").map(PathBuf::from);
 
         let rustc_bin = Self::resolve_rustc_bin_from(
             explicit.as_deref(),
@@ -439,24 +699,15 @@ impl WorkerConfig {
             home.as_deref(),
         );
 
-        let effective_rustup_home = rustup_home.or_else(|| {
-            if rustc_bin.starts_with("/var/lib/action-runner")
-                && Path::new("/var/lib/action-runner/.rustup").is_dir()
-            {
-                Some(PathBuf::from("/var/lib/action-runner/.rustup"))
-            } else {
-                None
-            }
-        });
-        let effective_cargo_home = cargo_home.or_else(|| {
-            if rustc_bin.starts_with("/var/lib/action-runner")
-                && Path::new("/var/lib/action-runner/.cargo").is_dir()
-            {
-                Some(PathBuf::from("/var/lib/action-runner/.cargo"))
-            } else {
-                None
-            }
-        });
+        let (effective_rustup_home, effective_cargo_home) = Self::infer_service_toolchain_homes(
+            &rustc_bin,
+            rustup_home,
+            cargo_home,
+            &[
+                Path::new("/var/lib/mu-ci-worker"),
+                Path::new("/var/lib/action-runner"),
+            ],
+        );
 
         Self::probe_rustc_semver_for(
             &rustc_bin,
@@ -1070,5 +1321,353 @@ mod tests {
                 Some(opt_out)
             ));
         }
+    }
+
+    static WORKER_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(keys: &[&str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| ((*k).to_string(), std::env::var_os(k)))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_default_workspace_dir_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mu_root = dir.path().join("mu-ci-worker");
+        let legacy_root = dir.path().join("action-runner");
+
+        // Neither exists -> canonical mu_root/workspace
+        assert_eq!(
+            WorkerConfig::resolve_default_workspace_dir(&mu_root, &legacy_root),
+            mu_root.join("workspace")
+        );
+
+        // Only legacy exists -> legacy_root/workspace
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        assert_eq!(
+            WorkerConfig::resolve_default_workspace_dir(&mu_root, &legacy_root),
+            legacy_root.join("workspace")
+        );
+
+        // Both exist -> mu_root/workspace wins
+        std::fs::create_dir_all(&mu_root).unwrap();
+        assert_eq!(
+            WorkerConfig::resolve_default_workspace_dir(&mu_root, &legacy_root),
+            mu_root.join("workspace")
+        );
+    }
+
+    #[test]
+    fn test_resolve_sccache_env_file_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mu_file = dir.path().join("mu-ci-worker/sccache.env");
+        let legacy_file = dir.path().join("action-runner/sccache.env");
+        std::fs::create_dir_all(mu_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+
+        // Neither exists -> defaults to mu_file
+        assert_eq!(
+            WorkerConfig::resolve_sccache_env_file_from(None, &mu_file, &legacy_file),
+            mu_file
+        );
+
+        // Only legacy exists -> legacy_file
+        std::fs::write(&legacy_file, "SCCACHE_BUCKET=legacy\n").unwrap();
+        assert_eq!(
+            WorkerConfig::resolve_sccache_env_file_from(None, &mu_file, &legacy_file),
+            legacy_file
+        );
+
+        // Both exist -> mu_file wins
+        std::fs::write(&mu_file, "SCCACHE_BUCKET=canonical\n").unwrap();
+        assert_eq!(
+            WorkerConfig::resolve_sccache_env_file_from(None, &mu_file, &legacy_file),
+            mu_file
+        );
+
+        // Explicit override wins over disk files
+        let explicit = dir.path().join("custom.env");
+        assert_eq!(
+            WorkerConfig::resolve_sccache_env_file_from(
+                Some(explicit.to_str().unwrap()),
+                &mu_file,
+                &legacy_file
+            ),
+            explicit
+        );
+    }
+
+    #[test]
+    fn test_resolve_rustc_bin_and_infer_service_roots_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mu_root = dir.path().join("var/lib/mu-ci-worker");
+        let legacy_root = dir.path().join("var/lib/action-runner");
+
+        std::fs::create_dir_all(legacy_root.join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(legacy_root.join(".rustup")).unwrap();
+        let legacy_rustc = legacy_root.join(".cargo/bin/rustc");
+        std::fs::write(&legacy_rustc, b"").unwrap();
+
+        // When only legacy service root has rustc, it is selected
+        let resolved_legacy = WorkerConfig::resolve_rustc_bin_from_roots(
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[mu_root.as_path(), legacy_root.as_path()],
+        );
+        assert_eq!(resolved_legacy, legacy_rustc);
+        let (legacy_rustup_home, legacy_cargo_home) = WorkerConfig::infer_service_toolchain_homes(
+            &resolved_legacy,
+            None,
+            None,
+            &[mu_root.as_path(), legacy_root.as_path()],
+        );
+        assert_eq!(legacy_rustup_home, Some(legacy_root.join(".rustup")));
+        assert_eq!(legacy_cargo_home, Some(legacy_root.join(".cargo")));
+
+        // When canonical mu-ci-worker service root also has rustc, canonical wins
+        std::fs::create_dir_all(mu_root.join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(mu_root.join(".rustup")).unwrap();
+        let mu_rustc = mu_root.join(".cargo/bin/rustc");
+        std::fs::write(&mu_rustc, b"").unwrap();
+
+        let resolved_mu = WorkerConfig::resolve_rustc_bin_from_roots(
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[mu_root.as_path(), legacy_root.as_path()],
+        );
+        assert_eq!(resolved_mu, mu_rustc);
+        let (mu_rustup_home, mu_cargo_home) = WorkerConfig::infer_service_toolchain_homes(
+            &resolved_mu,
+            None,
+            None,
+            &[mu_root.as_path(), legacy_root.as_path()],
+        );
+        assert_eq!(mu_rustup_home, Some(mu_root.join(".rustup")));
+        assert_eq!(mu_cargo_home, Some(mu_root.join(".cargo")));
+    }
+
+    #[test]
+    fn test_dual_env_helpers_and_fail_closed_secret_precedence() {
+        let mut env_map: std::collections::HashMap<&str, String> = Default::default();
+
+        // Legacy fallback when canonical unset
+        env_map.insert("ACTION_RUNNER_CLUSTER_TOKEN", "legacy-token".to_string());
+        assert_eq!(
+            WorkerConfig::resolve_secret_first_with_env(
+                &["MU_CI_WORKER_CLUSTER_TOKEN", "ACTION_RUNNER_CLUSTER_TOKEN"],
+                |k| env_map.get(k).cloned()
+            ),
+            Some("legacy-token".to_string())
+        );
+
+        // Canonical overrides legacy
+        env_map.insert("MU_CI_WORKER_CLUSTER_TOKEN", "canonical-token".to_string());
+        assert_eq!(
+            WorkerConfig::resolve_secret_first_with_env(
+                &["MU_CI_WORKER_CLUSTER_TOKEN", "ACTION_RUNNER_CLUSTER_TOKEN"],
+                |k| env_map.get(k).cloned()
+            ),
+            Some("canonical-token".to_string())
+        );
+
+        // Missing canonical secret path fails closed instead of falling back to legacy token
+        env_map.insert(
+            "MU_CI_WORKER_CLUSTER_TOKEN",
+            "/nonexistent/cluster_token".to_string(),
+        );
+        assert_eq!(
+            WorkerConfig::resolve_secret_first_with_env(
+                &["MU_CI_WORKER_CLUSTER_TOKEN", "ACTION_RUNNER_CLUSTER_TOKEN"],
+                |k| env_map.get(k).cloned()
+            ),
+            None
+        );
+
+        // Slots precedence: MU_CI_WORKER_MAX_SLOTS -> MU_CI_WORKER_SLOTS -> ACTION_RUNNER_MAX_SLOTS
+        env_map.insert("ACTION_RUNNER_MAX_SLOTS", "4".to_string());
+        assert_eq!(
+            first_parsed_in::<u32, _>(
+                &[
+                    "MU_CI_WORKER_MAX_SLOTS",
+                    "MU_CI_WORKER_SLOTS",
+                    "ACTION_RUNNER_MAX_SLOTS",
+                ],
+                &|k| env_map.get(k).cloned()
+            ),
+            Some(4)
+        );
+        env_map.insert("MU_CI_WORKER_SLOTS", "2".to_string());
+        assert_eq!(
+            first_parsed_in::<u32, _>(
+                &[
+                    "MU_CI_WORKER_MAX_SLOTS",
+                    "MU_CI_WORKER_SLOTS",
+                    "ACTION_RUNNER_MAX_SLOTS",
+                ],
+                &|k| env_map.get(k).cloned()
+            ),
+            Some(2)
+        );
+        env_map.insert("MU_CI_WORKER_MAX_SLOTS", "3".to_string());
+        assert_eq!(
+            first_parsed_in::<u32, _>(
+                &[
+                    "MU_CI_WORKER_MAX_SLOTS",
+                    "MU_CI_WORKER_SLOTS",
+                    "ACTION_RUNNER_MAX_SLOTS",
+                ],
+                &|k| env_map.get(k).cloned()
+            ),
+            Some(3)
+        );
+
+        // sccache env file dual-env precedence
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_sccache = dir.path().join("legacy-sccache.env");
+        let canonical_sccache = dir.path().join("mu-sccache.env");
+        std::fs::write(&legacy_sccache, "SCCACHE_BUCKET=legacy-bucket\n").unwrap();
+        std::fs::write(&canonical_sccache, "SCCACHE_BUCKET=canonical-bucket\n").unwrap();
+
+        env_map.insert(
+            "ACTION_RUNNER_SCCACHE_ENV_FILE",
+            legacy_sccache.to_str().unwrap().to_string(),
+        );
+        let envs_legacy = WorkerConfig::load_sccache_env_with_env(|k| env_map.get(k).cloned());
+        assert!(envs_legacy
+            .iter()
+            .any(|(k, v)| k == "SCCACHE_BUCKET" && v == "legacy-bucket"));
+
+        env_map.insert(
+            "MU_CI_WORKER_SCCACHE_ENV_FILE",
+            canonical_sccache.to_str().unwrap().to_string(),
+        );
+        let envs_canonical = WorkerConfig::load_sccache_env_with_env(|k| env_map.get(k).cloned());
+        assert!(envs_canonical
+            .iter()
+            .any(|(k, v)| k == "SCCACHE_BUCKET" && v == "canonical-bucket"));
+
+        // Verify process env helpers with unique test-only keys
+        let _lock = WORKER_ENV_TEST_LOCK.lock().unwrap();
+        let test_keys = [
+            "TEST_MU_CI_WORKER_ENV_PRIMARY",
+            "TEST_ACTION_RUNNER_ENV_FALLBACK",
+        ];
+        let _guard = EnvGuard::capture(&test_keys);
+        std::env::remove_var(test_keys[0]);
+        std::env::set_var(test_keys[1], "42");
+        assert_eq!(first_non_empty_env(&test_keys).as_deref(), Some("42"));
+        assert_eq!(first_parsed_env::<u32>(&test_keys), Some(42));
+        std::env::set_var(test_keys[0], "99");
+        assert_eq!(first_non_empty_env(&test_keys).as_deref(), Some("99"));
+        assert_eq!(first_parsed_env::<u32>(&test_keys), Some(99));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_worker_config_load_dual_env_precedence_and_fallback() {
+        let mut env_map: std::collections::HashMap<&str, String> = Default::default();
+        // Prevent probing host rustc on PATH in this isolated lookup test
+        env_map.insert(
+            "ACTION_RUNNER_RUSTC_BIN",
+            "/nonexistent/rustc-test".to_string(),
+        );
+        env_map.insert("ACTION_RUNNER_SCCACHE_BIN", "off".to_string());
+
+        // 1. Legacy ACTION_RUNNER_* values are honored when MU_CI_WORKER_* are unset.
+        env_map.insert("ACTION_RUNNER_NODE_ID", "legacy-node".to_string());
+        env_map.insert(
+            "ACTION_RUNNER_CONTROLLER_URL",
+            "ws://192.0.2.1:8000/tunnel".to_string(),
+        );
+        env_map.insert("ACTION_RUNNER_CLUSTER_TOKEN", "legacy-secret".to_string());
+        env_map.insert("ACTION_RUNNER_ARCH", "riscv64".to_string());
+        env_map.insert("ACTION_RUNNER_SLOTS", "2".to_string());
+        env_map.insert("ACTION_RUNNER_TAGS", "legacy,tag".to_string());
+        env_map.insert("ACTION_RUNNER_WORKSPACE", "/tmp/legacy-ws".to_string());
+        env_map.insert("ACTION_RUNNER_USE_BTRFS", "false".to_string());
+        env_map.insert("ACTION_RUNNER_ISOLATION", "systemd-run".to_string());
+        env_map.insert("ACTION_RUNNER_THREADS", "3".to_string());
+        env_map.insert("ACTION_RUNNER_DISABLED_TOOLS", "cargo-audit".to_string());
+
+        let legacy_cfg = WorkerConfig::load_with_env(|k| env_map.get(k).cloned());
+        assert_eq!(legacy_cfg.node_id, "legacy-node");
+        assert_eq!(legacy_cfg.controller_url, "ws://192.0.2.1:8000/tunnel");
+        assert_eq!(legacy_cfg.cluster_token, "legacy-secret");
+        assert_eq!(legacy_cfg.arch, "riscv64");
+        assert_eq!(legacy_cfg.max_slots, 2);
+        assert_eq!(legacy_cfg.tags, vec!["legacy", "tag"]);
+        assert_eq!(legacy_cfg.workspace_dir, PathBuf::from("/tmp/legacy-ws"));
+        assert!(!legacy_cfg.use_btrfs);
+        assert_eq!(legacy_cfg.isolation_mode, IsolationMode::SystemdRun);
+        assert_eq!(
+            legacy_cfg.max_threads_with_env(|k| env_map.get(k).cloned()),
+            3
+        );
+        assert!(legacy_cfg.is_tool_disabled_with_env("cargo-audit", |k| env_map.get(k).cloned()));
+        assert_eq!(
+            WorkerConfig::detect_rustc_bin_with_env(|k| env_map.get(k).cloned()),
+            PathBuf::from("/nonexistent/rustc-test")
+        );
+
+        // 2. Canonical MU_CI_WORKER_* values take precedence over ACTION_RUNNER_*.
+        env_map.insert("MU_CI_WORKER_NODE_ID", "canonical-node".to_string());
+        env_map.insert(
+            "MU_CI_WORKER_CONTROLLER_URL",
+            "ws://192.0.2.2:8000/tunnel".to_string(),
+        );
+        env_map.insert("MU_CI_WORKER_CLUSTER_TOKEN", "canonical-secret".to_string());
+        env_map.insert("MU_CI_WORKER_ARCH", "x86_64".to_string());
+        env_map.insert("MU_CI_WORKER_SLOTS", "4".to_string());
+        env_map.insert("MU_CI_WORKER_TAGS", "canonical,tag".to_string());
+        env_map.insert("MU_CI_WORKER_WORKSPACE", "/tmp/canonical-ws".to_string());
+        env_map.insert("MU_CI_WORKER_USE_BTRFS", "true".to_string());
+        env_map.insert("MU_CI_WORKER_ISOLATION", "none".to_string());
+        env_map.insert("MU_CI_WORKER_THREADS", "5".to_string());
+        env_map.insert("MU_CI_WORKER_DISABLED_TOOLS", "cargo-bench".to_string());
+        env_map.insert("MU_CI_WORKER_RUSTC_BIN", "/custom/mu/rustc".to_string());
+
+        let mu_cfg = WorkerConfig::load_with_env(|k| env_map.get(k).cloned());
+        assert_eq!(mu_cfg.node_id, "canonical-node");
+        assert_eq!(mu_cfg.controller_url, "ws://192.0.2.2:8000/tunnel");
+        assert_eq!(mu_cfg.cluster_token, "canonical-secret");
+        assert_eq!(mu_cfg.arch, "x86_64");
+        assert_eq!(mu_cfg.max_slots, 4);
+        assert_eq!(mu_cfg.tags, vec!["canonical", "tag"]);
+        assert_eq!(mu_cfg.workspace_dir, PathBuf::from("/tmp/canonical-ws"));
+        assert!(mu_cfg.use_btrfs);
+        assert_eq!(mu_cfg.isolation_mode, IsolationMode::None);
+        assert_eq!(mu_cfg.max_threads_with_env(|k| env_map.get(k).cloned()), 5);
+        assert!(mu_cfg.is_tool_disabled_with_env("cargo-bench", |k| env_map.get(k).cloned()));
+        assert!(!mu_cfg.is_tool_disabled_with_env("cargo-audit", |k| env_map.get(k).cloned()));
+        assert_eq!(
+            WorkerConfig::detect_rustc_bin_with_env(|k| env_map.get(k).cloned()),
+            PathBuf::from("/custom/mu/rustc")
+        );
     }
 }

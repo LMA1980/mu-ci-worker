@@ -21,7 +21,8 @@ use mu_ci_isolation::{
 };
 use tracing::error;
 
-/// Construct a safe default operator host ceiling when `/etc/mu-isolation/ceiling.yml` is not provisioned.
+/// Construct a safe default operator host ceiling when `/etc/mu-ci-isolation/ceiling.yml`
+/// (or legacy `/etc/mu-isolation/ceiling.yml`) is not provisioned.
 pub fn default_host_ceiling(node_id: &str, arch: &str) -> HostCeilingConfig {
     HostCeilingConfig {
         node_id: node_id.to_string(),
@@ -30,6 +31,7 @@ pub fn default_host_ceiling(node_id: &str, arch: &str) -> HostCeilingConfig {
         allowed_read_prefixes: vec![PathBuf::from("/")],
         allowed_write_prefixes: vec![
             PathBuf::from("/tmp"),
+            PathBuf::from("/var/lib/mu-ci-worker"),
             PathBuf::from("/var/lib/action-runner"),
             std::env::temp_dir(),
         ],
@@ -38,6 +40,7 @@ pub fn default_host_ceiling(node_id: &str, arch: &str) -> HostCeilingConfig {
             PathBuf::from("/usr/bin"),
             PathBuf::from("/usr/local/bin"),
             PathBuf::from("/opt"),
+            PathBuf::from("/var/lib/mu-ci-worker"),
             PathBuf::from("/var/lib/action-runner"),
             std::env::temp_dir(),
         ],
@@ -127,12 +130,50 @@ pub struct WorkerSandboxRunner {
     pub proc_ai_thread_path: PathBuf,
 }
 
+/// Resolve the Layer 1 host ceiling path using the precedence:
+/// `MU_CI_ISOLATION_CEILING_PATH` -> `MU_ISOLATION_CEILING_PATH` ->
+/// `mu_ci_disk` (if present on disk) -> `mu_disk` (if present on disk) -> `mu_ci_disk`.
+#[must_use]
+pub fn resolve_ceiling_path_from(
+    mu_ci_env: Option<&str>,
+    mu_env: Option<&str>,
+    mu_ci_disk: &Path,
+    mu_disk: &Path,
+) -> PathBuf {
+    if let Some(p) = mu_ci_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(p);
+    }
+    if let Some(p) = mu_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(p);
+    }
+    if mu_ci_disk.is_file() {
+        return mu_ci_disk.to_path_buf();
+    }
+    if mu_disk.is_file() {
+        return mu_disk.to_path_buf();
+    }
+    mu_ci_disk.to_path_buf()
+}
+
 impl WorkerSandboxRunner {
     /// Construct a new sandbox runner with standard system paths.
     pub fn new(node_id: String, arch: String) -> Self {
-        let ceiling_path = std::env::var("MU_ISOLATION_CEILING_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/etc/mu-isolation/ceiling.yml"));
+        Self::new_with_env(node_id, arch, |k| std::env::var(k).ok())
+    }
+
+    /// Construct a new sandbox runner using a custom environment lookup closure.
+    pub fn new_with_env<F>(node_id: String, arch: String, get_env: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mu_ci_env = get_env("MU_CI_ISOLATION_CEILING_PATH");
+        let mu_env = get_env("MU_ISOLATION_CEILING_PATH");
+        let ceiling_path = resolve_ceiling_path_from(
+            mu_ci_env.as_deref(),
+            mu_env.as_deref(),
+            Path::new("/etc/mu-ci-isolation/ceiling.yml"),
+            Path::new("/etc/mu-isolation/ceiling.yml"),
+        );
 
         Self {
             node_id,
@@ -548,6 +589,97 @@ allow_spacemit_ai_thread: false
         assert!(
             !contents.trim().is_empty(),
             "Thread ID must be written to procfs node"
+        );
+    }
+
+    #[test]
+    fn test_default_host_ceiling_includes_canonical_and_legacy_roots() {
+        let ceiling = default_host_ceiling("worker-node", "x86_64");
+        assert!(ceiling
+            .allowed_write_prefixes
+            .contains(&PathBuf::from("/var/lib/mu-ci-worker")));
+        assert!(ceiling
+            .allowed_write_prefixes
+            .contains(&PathBuf::from("/var/lib/action-runner")));
+        assert!(ceiling
+            .allowed_exec_prefixes
+            .contains(&PathBuf::from("/var/lib/mu-ci-worker")));
+        assert!(ceiling
+            .allowed_exec_prefixes
+            .contains(&PathBuf::from("/var/lib/action-runner")));
+    }
+
+    #[test]
+    fn test_resolve_ceiling_path_precedence_and_runner_new() {
+        let dir = tempdir().unwrap();
+        let mu_ci_disk = dir.path().join("etc/mu-ci-isolation/ceiling.yml");
+        let mu_disk = dir.path().join("etc/mu-isolation/ceiling.yml");
+        std::fs::create_dir_all(mu_ci_disk.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mu_disk.parent().unwrap()).unwrap();
+
+        // Neither disk file nor env exists -> defaults to mu_ci_disk
+        assert_eq!(
+            resolve_ceiling_path_from(None, None, &mu_ci_disk, &mu_disk),
+            mu_ci_disk
+        );
+
+        // Only legacy mu_disk exists -> selects mu_disk
+        std::fs::write(&mu_disk, "node_id: legacy\n").unwrap();
+        assert_eq!(
+            resolve_ceiling_path_from(None, None, &mu_ci_disk, &mu_disk),
+            mu_disk
+        );
+
+        // Both disk files exist -> mu_ci_disk wins
+        std::fs::write(&mu_ci_disk, "node_id: canonical\n").unwrap();
+        assert_eq!(
+            resolve_ceiling_path_from(None, None, &mu_ci_disk, &mu_disk),
+            mu_ci_disk
+        );
+
+        // MU_ISOLATION_CEILING_PATH beats disk files
+        assert_eq!(
+            resolve_ceiling_path_from(None, Some("/custom/mu/ceiling.yml"), &mu_ci_disk, &mu_disk),
+            PathBuf::from("/custom/mu/ceiling.yml")
+        );
+
+        // MU_CI_ISOLATION_CEILING_PATH beats MU_ISOLATION_CEILING_PATH and disk files
+        assert_eq!(
+            resolve_ceiling_path_from(
+                Some("/custom/mu-ci/ceiling.yml"),
+                Some("/custom/mu/ceiling.yml"),
+                &mu_ci_disk,
+                &mu_disk
+            ),
+            PathBuf::from("/custom/mu-ci/ceiling.yml")
+        );
+
+        // Verify WorkerSandboxRunner::new_with_env env var precedence without mutating global env
+        let mut env_map: std::collections::HashMap<&str, String> = Default::default();
+        env_map.insert(
+            "MU_ISOLATION_CEILING_PATH",
+            "/tmp/legacy-ceiling.yml".to_string(),
+        );
+        let r_legacy =
+            WorkerSandboxRunner::new_with_env("worker-node".into(), "x86_64".into(), |k| {
+                env_map.get(k).cloned()
+            });
+        assert_eq!(
+            r_legacy.ceiling_path,
+            PathBuf::from("/tmp/legacy-ceiling.yml")
+        );
+
+        env_map.insert(
+            "MU_CI_ISOLATION_CEILING_PATH",
+            "/tmp/canonical-ceiling.yml".to_string(),
+        );
+        let r_canonical =
+            WorkerSandboxRunner::new_with_env("worker-node".into(), "x86_64".into(), |k| {
+                env_map.get(k).cloned()
+            });
+        assert_eq!(
+            r_canonical.ceiling_path,
+            PathBuf::from("/tmp/canonical-ceiling.yml")
         );
     }
 }

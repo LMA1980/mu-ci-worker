@@ -93,7 +93,8 @@ pub fn parse_proc_meminfo(contents: &str) -> Option<(u64, u64)> {
 
 /// Detect the host's physical total RAM and currently used RAM in MiB.
 ///
-/// Reads `/proc/meminfo` on Linux, with optional override via `ACTION_RUNNER_RAM_TOTAL_MB`.
+/// Reads `/proc/meminfo` on Linux, with optional override via
+/// `MU_CI_WORKER_RAM_TOTAL_MB` (falling back to `ACTION_RUNNER_RAM_TOTAL_MB`).
 /// Falls back to `(32768, 1024)` on non-Linux hosts where `/proc/meminfo` is unavailable.
 pub fn detect_system_memory_mb() -> (u64, u64) {
     let detected = std::fs::read_to_string("/proc/meminfo")
@@ -102,10 +103,11 @@ pub fn detect_system_memory_mb() -> (u64, u64) {
 
     let (mut total_mb, mut used_mb) = detected.unwrap_or((32768, 1024));
 
-    if let Some(override_total) = std::env::var("ACTION_RUNNER_RAM_TOTAL_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&v| v > 0)
+    if let Some(override_total) = crate::config::first_parsed_env::<u64>(&[
+        "MU_CI_WORKER_RAM_TOTAL_MB",
+        "ACTION_RUNNER_RAM_TOTAL_MB",
+    ])
+    .filter(|&v| v > 0)
     {
         total_mb = override_total;
         used_mb = used_mb.min(total_mb);
@@ -437,12 +439,13 @@ impl WorkerAgent {
         let mut reg_frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + reg_payload.len());
         reg_frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&reg_hdr));
         reg_frame.extend_from_slice(&reg_payload);
-        let write_timeout = std::env::var("MU_CI_WRITE_TIMEOUT_SECS")
-            .or_else(|_| std::env::var("ACTION_RUNNER_WRITE_TIMEOUT_SECS"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(10));
+        let write_timeout = crate::config::first_parsed_env::<u64>(&[
+            "MU_CI_WORKER_WRITE_TIMEOUT_SECS",
+            "MU_CI_WRITE_TIMEOUT_SECS",
+            "ACTION_RUNNER_WRITE_TIMEOUT_SECS",
+        ])
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(10));
 
         tokio::time::timeout(
             write_timeout,
@@ -470,12 +473,13 @@ impl WorkerAgent {
         let hb_tx = outbound_tx.clone();
         let hb_fory = create_fory_runtime()?;
 
-        let ping_interval = std::env::var("MU_CI_PING_INTERVAL_SECS")
-            .or_else(|_| std::env::var("ACTION_RUNNER_PING_INTERVAL_SECS"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(5));
+        let ping_interval = crate::config::first_parsed_env::<u64>(&[
+            "MU_CI_WORKER_PING_INTERVAL_SECS",
+            "MU_CI_PING_INTERVAL_SECS",
+            "ACTION_RUNNER_PING_INTERVAL_SECS",
+        ])
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(5));
 
         let hb_handle = tokio::spawn(async move {
             let mut hb_seq = 1000u64;
@@ -514,12 +518,13 @@ impl WorkerAgent {
         });
 
         let stage_runner = Arc::new(StageRunner::new(self.config.clone()));
-        let liveness_timeout = std::env::var("MU_CI_LIVENESS_TIMEOUT_SECS")
-            .or_else(|_| std::env::var("ACTION_RUNNER_LIVENESS_TIMEOUT_SECS"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(15));
+        let liveness_timeout = crate::config::first_parsed_env::<u64>(&[
+            "MU_CI_WORKER_LIVENESS_TIMEOUT_SECS",
+            "MU_CI_LIVENESS_TIMEOUT_SECS",
+            "ACTION_RUNNER_LIVENESS_TIMEOUT_SECS",
+        ])
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(15));
         let mut liveness_deadline = tokio::time::Instant::now() + liveness_timeout;
 
         loop {

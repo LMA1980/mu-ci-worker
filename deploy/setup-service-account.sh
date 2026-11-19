@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "================================================================================"
-echo "  ActionRunner Service Account & Security Isolation Provisioning"
+echo "  Mu-CI Worker Service Account & Security Isolation Provisioning"
 echo "================================================================================"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -10,117 +10,134 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# 1. Create action-runner system user and group if not present
-if ! id -u action-runner >/dev/null 2>&1; then
-    echo "Creating system service account: action-runner"
-    useradd -r -m -d /var/lib/action-runner -s /bin/bash -c "ActionRunner CI Daemon" action-runner
+# 1. Create mu-ci-worker system user and group if not present
+if ! id -u mu-ci-worker >/dev/null 2>&1; then
+    echo "Creating system service account: mu-ci-worker"
+    useradd -r -m -d /var/lib/mu-ci-worker -s /bin/bash -c "Mu-CI Worker Daemon" mu-ci-worker
 else
-    echo "System service account action-runner already exists."
+    echo "System service account mu-ci-worker already exists."
 fi
 
 # 2. Prepare workspace and config directories with strict ownership (0750 / 0700)
-echo "Setting up /var/lib/action-runner and /etc/action-runner"
-mkdir -p /var/lib/action-runner/workspace/repos
-mkdir -p /var/lib/action-runner/workspace/logs
-mkdir -p /var/lib/action-runner/workspace/.cargo
-mkdir -p /var/lib/action-runner/web/dist
-mkdir -p /etc/action-runner
+echo "Setting up /var/lib/mu-ci-worker and /etc/mu-ci-worker"
+mkdir -p /var/lib/mu-ci-worker/workspace/repos
+mkdir -p /var/lib/mu-ci-worker/workspace/logs
+mkdir -p /var/lib/mu-ci-worker/workspace/.cargo
+mkdir -p /var/lib/mu-ci-worker/.cache
+mkdir -p /etc/mu-ci-worker
 
-if [ -d "/var/www/action-runner-web" ] && [ ! -f "/var/lib/action-runner/web/dist/index.html" ]; then
-    echo "Syncing initial web assets from /var/www/action-runner-web to /var/lib/action-runner/web/dist"
-    cp -r /var/www/action-runner-web/* /var/lib/action-runner/web/dist/ 2>/dev/null || true
-fi
-
-# Migrate past execution history if present in old workspace
-if [ -d "/home/lma1980/repository/ci-workspace/logs" ] && [ ! -f "/var/lib/action-runner/workspace/logs/jobs_index.json" ]; then
-    echo "Migrating past execution history from /home/lma1980/repository/ci-workspace/logs"
-    cp -a /home/lma1980/repository/ci-workspace/logs/* /var/lib/action-runner/workspace/logs/ 2>/dev/null || true
-fi
-
-chown -R action-runner:action-runner /var/lib/action-runner
-chown -R action-runner:action-runner /etc/action-runner
-chmod 750 /var/lib/action-runner
-chmod 700 /etc/action-runner
-
-# 3. Migrate webhook secret if present in /home/lma1980/.github_webhook_secret
-if [ -f "/home/lma1980/.github_webhook_secret" ]; then
-    if [ ! -f "/etc/action-runner/github_webhook_secret" ]; then
-        echo "Copying webhook secret from /home/lma1980/.github_webhook_secret to /etc/action-runner/github_webhook_secret"
-        cp /home/lma1980/.github_webhook_secret /etc/action-runner/github_webhook_secret
+# Migrate legacy worker configuration secrets/env if present and target does not exist
+for secret_file in cluster_token sccache.env; do
+    if [ -f "/etc/action-runner/${secret_file}" ] && [ ! -f "/etc/mu-ci-worker/${secret_file}" ]; then
+        echo "Migrating /etc/action-runner/${secret_file} to /etc/mu-ci-worker/${secret_file}"
+        cp "/etc/action-runner/${secret_file}" "/etc/mu-ci-worker/${secret_file}"
+        chmod 600 "/etc/mu-ci-worker/${secret_file}"
     fi
-    if [ ! -f "/var/lib/action-runner/.github_webhook_secret" ]; then
-        cp /home/lma1980/.github_webhook_secret /var/lib/action-runner/.github_webhook_secret
+done
+
+chown -R mu-ci-worker:mu-ci-worker /var/lib/mu-ci-worker
+chown -R mu-ci-worker:mu-ci-worker /etc/mu-ci-worker
+chmod 750 /var/lib/mu-ci-worker
+chmod 700 /etc/mu-ci-worker
+
+# 3. Provision Rust toolchain (.rustup) and Cargo subcommands (cargo-audit, cargo-llvm-cov)
+if [ ! -d "/var/lib/mu-ci-worker/.rustup/toolchains" ]; then
+    if [ -d "/var/lib/action-runner/.rustup/toolchains" ]; then
+        echo "Provisioning Rustup toolchain for mu-ci-worker from /var/lib/action-runner/.rustup"
+        mkdir -p /var/lib/mu-ci-worker/.rustup
+        cp -a /var/lib/action-runner/.rustup/. /var/lib/mu-ci-worker/.rustup/
+    elif [ -d "/home/lma1980/.rustup/toolchains" ]; then
+        echo "Provisioning Rustup toolchain for mu-ci-worker from /home/lma1980/.rustup"
+        mkdir -p /var/lib/mu-ci-worker/.rustup
+        cp -a /home/lma1980/.rustup/. /var/lib/mu-ci-worker/.rustup/
     fi
-    chown action-runner:action-runner /etc/action-runner/github_webhook_secret /var/lib/action-runner/.github_webhook_secret
-    chmod 600 /etc/action-runner/github_webhook_secret /var/lib/action-runner/.github_webhook_secret
-fi
-
-# 3b. Provision Rust toolchain (.rustup) and Cargo subcommands (cargo-audit, cargo-llvm-cov)
-if [ -d "/home/lma1980/.rustup/toolchains" ] && [ ! -d "/var/lib/action-runner/.rustup/toolchains" ]; then
-    echo "Provisioning Rustup toolchain for action-runner from /home/lma1980/.rustup"
-    mkdir -p /var/lib/action-runner/.rustup
-    cp -a /home/lma1980/.rustup/. /var/lib/action-runner/.rustup/
-    chown -R action-runner:action-runner /var/lib/action-runner/.rustup
-fi
-
-if [ -d "/home/lma1980/.cargo/bin" ]; then
-    mkdir -p /var/lib/action-runner/.cargo/bin /var/lib/action-runner/workspace/.cargo/bin
-    cp -a /home/lma1980/.cargo/bin/* /var/lib/action-runner/.cargo/bin/ 2>/dev/null || true
-    cp -a /home/lma1980/.cargo/bin/* /var/lib/action-runner/workspace/.cargo/bin/ 2>/dev/null || true
-    if [ -d "/home/lma1980/.cargo/advisory-db" ] && [ ! -d "/var/lib/action-runner/workspace/.cargo/advisory-db" ]; then
-        cp -a /home/lma1980/.cargo/advisory-db /var/lib/action-runner/workspace/.cargo/advisory-db
+    if [ -d "/var/lib/mu-ci-worker/.rustup" ]; then
+        chown -R mu-ci-worker:mu-ci-worker /var/lib/mu-ci-worker/.rustup
     fi
-    chown -R action-runner:action-runner /var/lib/action-runner/.cargo /var/lib/action-runner/workspace/.cargo
 fi
 
-# 3c. Provision Python user site-packages (.local) such as mdformat-gfm
-if [ -d "/home/lma1980/.local" ] && [ ! -d "/var/lib/action-runner/.local/lib" ]; then
-    echo "Provisioning Python .local packages (e.g., mdformat-gfm) for action-runner"
-    mkdir -p /var/lib/action-runner/.local
-    cp -a /home/lma1980/.local/. /var/lib/action-runner/.local/
-    chown -R action-runner:action-runner /var/lib/action-runner/.local
+CARGO_SRC_DIR=""
+if [ -d "/var/lib/action-runner/.cargo/bin" ]; then
+    CARGO_SRC_DIR="/var/lib/action-runner/.cargo"
+elif [ -d "/home/lma1980/.cargo/bin" ]; then
+    CARGO_SRC_DIR="/home/lma1980/.cargo"
 fi
 
-# 4. Migrate CI SSH Deploy Key if present
-if [ -f "/home/lma1980/.ssh/id_k3_ci" ] && [ ! -f "/var/lib/action-runner/.ssh/id_k3_ci" ]; then
-    echo "Provisioning CI deploy key for action-runner"
-    mkdir -p /var/lib/action-runner/.ssh
-    cp /home/lma1980/.ssh/id_k3_ci /var/lib/action-runner/.ssh/id_k3_ci
-    if [ -f "/home/lma1980/.ssh/id_k3_ci.pub" ]; then
-        cp /home/lma1980/.ssh/id_k3_ci.pub /var/lib/action-runner/.ssh/id_k3_ci.pub
+if [ -n "${CARGO_SRC_DIR}" ]; then
+    mkdir -p /var/lib/mu-ci-worker/.cargo/bin /var/lib/mu-ci-worker/workspace/.cargo/bin
+    cp -a "${CARGO_SRC_DIR}"/bin/* /var/lib/mu-ci-worker/.cargo/bin/ 2>/dev/null || true
+    cp -a "${CARGO_SRC_DIR}"/bin/* /var/lib/mu-ci-worker/workspace/.cargo/bin/ 2>/dev/null || true
+    if [ -d "${CARGO_SRC_DIR}/advisory-db" ] && [ ! -d "/var/lib/mu-ci-worker/workspace/.cargo/advisory-db" ]; then
+        cp -a "${CARGO_SRC_DIR}/advisory-db" /var/lib/mu-ci-worker/workspace/.cargo/advisory-db
     fi
-    cat << 'EOF' > /var/lib/action-runner/.ssh/config
+    if [ -d "${CARGO_SRC_DIR}/advisory-db" ] && [ ! -d "/var/lib/mu-ci-worker/.cargo/advisory-db" ]; then
+        cp -a "${CARGO_SRC_DIR}/advisory-db" /var/lib/mu-ci-worker/.cargo/advisory-db
+    fi
+    chown -R mu-ci-worker:mu-ci-worker /var/lib/mu-ci-worker/.cargo /var/lib/mu-ci-worker/workspace/.cargo
+fi
+
+# 3b. Provision Python user site-packages (.local) such as mdformat-gfm
+if [ ! -d "/var/lib/mu-ci-worker/.local/lib" ]; then
+    if [ -d "/var/lib/action-runner/.local/lib" ]; then
+        echo "Provisioning Python .local packages (e.g., mdformat-gfm) for mu-ci-worker from /var/lib/action-runner/.local"
+        mkdir -p /var/lib/mu-ci-worker/.local
+        cp -a /var/lib/action-runner/.local/. /var/lib/mu-ci-worker/.local/
+    elif [ -d "/home/lma1980/.local" ]; then
+        echo "Provisioning Python .local packages (e.g., mdformat-gfm) for mu-ci-worker from /home/lma1980/.local"
+        mkdir -p /var/lib/mu-ci-worker/.local
+        cp -a /home/lma1980/.local/. /var/lib/mu-ci-worker/.local/
+    fi
+    if [ -d "/var/lib/mu-ci-worker/.local" ]; then
+        chown -R mu-ci-worker:mu-ci-worker /var/lib/mu-ci-worker/.local
+    fi
+fi
+
+# 4. Provision CI SSH Deploy Key if present
+SSH_KEY_SRC=""
+if [ -f "/var/lib/action-runner/.ssh/id_k3_ci" ]; then
+    SSH_KEY_SRC="/var/lib/action-runner/.ssh/id_k3_ci"
+elif [ -f "/home/lma1980/.ssh/id_k3_ci" ]; then
+    SSH_KEY_SRC="/home/lma1980/.ssh/id_k3_ci"
+fi
+
+if [ -n "${SSH_KEY_SRC}" ] && [ ! -f "/var/lib/mu-ci-worker/.ssh/id_k3_ci" ]; then
+    echo "Provisioning CI deploy key for mu-ci-worker"
+    mkdir -p /var/lib/mu-ci-worker/.ssh
+    cp "${SSH_KEY_SRC}" /var/lib/mu-ci-worker/.ssh/id_k3_ci
+    if [ -f "${SSH_KEY_SRC}.pub" ]; then
+        cp "${SSH_KEY_SRC}.pub" /var/lib/mu-ci-worker/.ssh/id_k3_ci.pub
+    fi
+    cat << 'EOF' > /var/lib/mu-ci-worker/.ssh/config
 Host github.com
     HostName github.com
     User git
-    IdentityFile /var/lib/action-runner/.ssh/id_k3_ci
+    IdentityFile /var/lib/mu-ci-worker/.ssh/id_k3_ci
     IdentitiesOnly yes
     StrictHostKeyChecking accept-new
 EOF
-    chown -R action-runner:action-runner /var/lib/action-runner/.ssh
-    chmod 700 /var/lib/action-runner/.ssh
-    chmod 600 /var/lib/action-runner/.ssh/id_k3_ci
-    chmod 600 /var/lib/action-runner/.ssh/config
+    chown -R mu-ci-worker:mu-ci-worker /var/lib/mu-ci-worker/.ssh
+    chmod 700 /var/lib/mu-ci-worker/.ssh
+    chmod 600 /var/lib/mu-ci-worker/.ssh/id_k3_ci
+    chmod 600 /var/lib/mu-ci-worker/.ssh/config
 fi
 
 # 5. Install Sudoers configuration for user lma1980 diagnostics
-echo "Installing sudoers diagnostics policy in /etc/sudoers.d/action-runner-diag"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp "${SCRIPT_DIR}/sudoers-action-runner" /etc/sudoers.d/action-runner-diag
-chmod 440 /etc/sudoers.d/action-runner-diag
-visudo -c -f /etc/sudoers.d/action-runner-diag
+echo "Installing sudoers diagnostics policy in /etc/sudoers.d/mu-ci-worker-diag"
+cp "${SCRIPT_DIR}/sudoers-mu-ci-worker" /etc/sudoers.d/mu-ci-worker-diag
+chmod 440 /etc/sudoers.d/mu-ci-worker-diag
+visudo -c -f /etc/sudoers.d/mu-ci-worker-diag
 
 # 6. Install Systemd Service Unit
-echo "Installing /etc/systemd/system/action-runner.service"
-cp "${SCRIPT_DIR}/action-runner.service" /etc/systemd/system/action-runner.service
-chmod 644 /etc/systemd/system/action-runner.service
+echo "Installing /etc/systemd/system/mu-ci-worker.service"
+cp "${SCRIPT_DIR}/mu-ci-worker.service" /etc/systemd/system/mu-ci-worker.service
+chmod 644 /etc/systemd/system/mu-ci-worker.service
 
-# 7. Optional: Install Nginx Hardening Drop-in (cgroup v2 & namespace sandboxing)
-if [ -d "/etc/nginx" ] || command -v nginx >/dev/null 2>&1; then
-    echo "Installing Nginx hardening drop-in in /etc/systemd/system/nginx.service.d/override.conf"
-    mkdir -p /etc/systemd/system/nginx.service.d
-    cp "${SCRIPT_DIR}/nginx-override.conf" /etc/systemd/system/nginx.service.d/override.conf
-    chmod 644 /etc/systemd/system/nginx.service.d/override.conf
+if [ ! -f "/etc/mu-ci-worker/worker.env" ]; then
+    echo "Installing template /etc/mu-ci-worker/worker.env (customize before starting)"
+    cp "${SCRIPT_DIR}/mu-ci-worker.env.example" /etc/mu-ci-worker/worker.env
+    chown mu-ci-worker:mu-ci-worker /etc/mu-ci-worker/worker.env
+    chmod 600 /etc/mu-ci-worker/worker.env
 fi
 
 systemctl daemon-reload
@@ -128,7 +145,7 @@ systemctl daemon-reload
 echo "================================================================================"
 echo "  Provisioning complete!"
 echo "  To test sudo diagnostics as lma1980:"
-echo "    sudo -u action-runner -i"
+echo "    sudo -u mu-ci-worker -i"
 echo "  To enable and start the service:"
-echo "    sudo systemctl enable --now action-runner"
+echo "    sudo systemctl enable --now mu-ci-worker"
 echo "================================================================================"
