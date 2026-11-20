@@ -797,7 +797,7 @@ dependencies = [
 [[package]]
 name = "mu-ci-tools"
 version = "0.1.1"
-source = "git+https://github.com/LMA1980/mu-ci-tools.git?branch=main#607d12f244406f5febd56a6cf0c65cbb7832b765"
+source = "git+https://github.com/LMA1980/mu-ci-tools.git?branch=main#1261ac6bc9880495d8b95400f8ad34c3f25be766"
 dependencies = [
  "serde",
  "serde_json",

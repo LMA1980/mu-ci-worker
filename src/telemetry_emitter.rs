@@ -1313,6 +1313,7 @@ mod tests {
                     vlen_bits: Some(256),
                 },
             ],
+            ..ToolExecutionMetrics::default()
         };
 
         let ts_ns = 1_700_000_050_000_000_000;
