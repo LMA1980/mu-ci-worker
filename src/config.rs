@@ -172,24 +172,7 @@ impl WorkerConfig {
             )
         });
 
-        let mut toolchains = vec!["system".to_string()];
-        if Path::new("/opt/llvm-24-spacemit-x100/bin/clang").exists()
-            || Path::new("/home/lma1980/opt/llvm-24/bin/clang").exists()
-            || Path::new("/opt/cross-llvm-24/bin/clang").exists()
-        {
-            toolchains.push("llvm-24".to_string());
-        }
-        if Path::new("/opt/gcc-17-spacemit-x100/bin/riscv64-unknown-linux-gnu-gcc").exists()
-            || Path::new("/opt/gcc-17-spacemit-x100/bin/gcc").exists()
-            || Path::new("/home/lma1980/opt/gcc-17-spacemit-x100/bin/riscv64-unknown-linux-gnu-gcc")
-                .exists()
-            || Path::new("/home/lma1980/opt/gcc-17-spacemit-x100/bin/gcc").exists()
-            || Path::new("/opt/cross-gcc-17/bin/riscv64-unknown-linux-gnu-gcc").exists()
-        {
-            toolchains.push("gcc-17-spacemit-x100".to_string());
-        } else if Path::new("/home/lma1980/opt/gcc-17/bin/gcc").exists() {
-            toolchains.push("gcc-17".to_string());
-        }
+        let toolchains = Self::detect_toolchains(&arch);
 
         let use_btrfs = first_non_empty_in(
             &["MU_CI_WORKER_USE_BTRFS", "ACTION_RUNNER_USE_BTRFS"],
@@ -239,6 +222,146 @@ impl WorkerConfig {
         );
 
         cfg
+    }
+
+    /// Probes installed LLVM-24 and GCC-17 toolchains (native, RVA23, SpacemiT X100/A100,
+    /// `x86_64`, and `aarch64`) for worker capability advertisement.
+    #[must_use]
+    pub fn detect_toolchains(arch: &str) -> Vec<String> {
+        Self::detect_toolchains_with_probe(arch, |p| Path::new(p).exists())
+    }
+
+    #[must_use]
+    pub fn detect_toolchains_with_probe<F>(arch: &str, mut exists: F) -> Vec<String>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut toolchains = vec!["system".to_string()];
+        Self::detect_llvm_toolchains(arch, &mut exists, &mut toolchains);
+        Self::detect_gcc_toolchains(arch, &mut exists, &mut toolchains);
+        toolchains
+    }
+
+    fn push_unique_toolchain(toolchains: &mut Vec<String>, name: &str) {
+        if !toolchains.iter().any(|t| t == name) {
+            toolchains.push(name.to_string());
+        }
+    }
+
+    fn detect_llvm_toolchains<F>(arch: &str, exists: &mut F, toolchains: &mut Vec<String>)
+    where
+        F: FnMut(&str) -> bool,
+    {
+        const LLVM_DIRS: [&str; 5] = [
+            "/opt/llvm-24/bin",
+            "/opt/llvm-24-spacemit-x100/bin",
+            "/opt/llvm-24-spacemit-a100/bin",
+            "/home/lma1980/opt/llvm-24/bin",
+            "/opt/cross-llvm-24/bin",
+        ];
+        if !LLVM_DIRS.iter().any(|d| exists(&format!("{d}/clang"))) {
+            return;
+        }
+        Self::push_unique_toolchain(toolchains, "llvm-24");
+        if exists("/opt/llvm-24/bin/clang") || exists("/home/lma1980/opt/llvm-24/bin/clang") {
+            Self::push_unique_toolchain(toolchains, "llvm-24-native");
+        }
+        if LLVM_DIRS.iter().any(|d| {
+            exists(&format!("{d}/riscv64-rva23-linux-gnu-clang"))
+                || exists(&format!("{d}/riscv64-linux-gnu-clang"))
+                || exists(&format!("{d}/riscv64-unknown-linux-gnu-clang"))
+        }) {
+            Self::push_unique_toolchain(toolchains, "llvm-24-rva23");
+        }
+        if exists("/opt/llvm-24-spacemit-x100/bin/clang")
+            || LLVM_DIRS
+                .iter()
+                .any(|d| exists(&format!("{d}/riscv64-spacemit-x100-linux-gnu-clang")))
+        {
+            Self::push_unique_toolchain(toolchains, "llvm-24-spacemit-x100");
+        }
+        if exists("/opt/llvm-24-spacemit-a100/bin/clang")
+            || LLVM_DIRS
+                .iter()
+                .any(|d| exists(&format!("{d}/riscv64-spacemit-a100-linux-gnu-clang")))
+        {
+            Self::push_unique_toolchain(toolchains, "llvm-24-spacemit-a100");
+        }
+        if (arch == "x86_64" && exists("/opt/llvm-24/bin/clang"))
+            || LLVM_DIRS.iter().any(|d| {
+                exists(&format!("{d}/x86_64-linux-gnu-clang"))
+                    || exists(&format!("{d}/x86_64-unknown-linux-gnu-clang"))
+            })
+        {
+            Self::push_unique_toolchain(toolchains, "llvm-24-x86_64");
+        }
+        if (is_arm_arch(arch) && exists("/opt/llvm-24/bin/clang"))
+            || LLVM_DIRS.iter().any(|d| {
+                exists(&format!("{d}/aarch64-linux-gnu-clang"))
+                    || exists(&format!("{d}/aarch64-unknown-linux-gnu-clang"))
+            })
+        {
+            Self::push_unique_toolchain(toolchains, "llvm-24-aarch64");
+        }
+    }
+
+    fn detect_gcc_toolchains<F>(arch: &str, exists: &mut F, toolchains: &mut Vec<String>)
+    where
+        F: FnMut(&str) -> bool,
+    {
+        const GCC_DIRS: [&str; 6] = [
+            "/opt/gcc-17/bin",
+            "/opt/gcc-17-spacemit-x100/bin",
+            "/opt/gcc-17-spacemit-a100/bin",
+            "/home/lma1980/opt/gcc-17-spacemit-x100/bin",
+            "/home/lma1980/opt/gcc-17/bin",
+            "/opt/cross-gcc-17/bin",
+        ];
+        let has_native =
+            exists("/opt/gcc-17/bin/gcc") || exists("/home/lma1980/opt/gcc-17/bin/gcc");
+        let has_rva23 = GCC_DIRS.iter().any(|d| {
+            exists(&format!("{d}/riscv64-rva23-linux-gnu-gcc"))
+                || exists(&format!("{d}/riscv64-linux-gnu-gcc"))
+                || exists(&format!("{d}/riscv64-unknown-linux-gnu-gcc"))
+        });
+        let has_x100 = exists("/opt/gcc-17-spacemit-x100/bin/gcc")
+            || exists("/opt/gcc-17-spacemit-x100/bin/riscv64-unknown-linux-gnu-gcc")
+            || exists("/home/lma1980/opt/gcc-17-spacemit-x100/bin/gcc")
+            || exists("/home/lma1980/opt/gcc-17-spacemit-x100/bin/riscv64-unknown-linux-gnu-gcc")
+            || exists("/opt/cross-gcc-17/bin/riscv64-unknown-linux-gnu-gcc")
+            || GCC_DIRS
+                .iter()
+                .any(|d| exists(&format!("{d}/riscv64-spacemit-x100-linux-gnu-gcc")));
+        let has_a100 = exists("/opt/gcc-17-spacemit-a100/bin/gcc")
+            || GCC_DIRS
+                .iter()
+                .any(|d| exists(&format!("{d}/riscv64-spacemit-a100-linux-gnu-gcc")));
+        let has_x86_64 = (arch == "x86_64" && has_native)
+            || GCC_DIRS.iter().any(|d| {
+                exists(&format!("{d}/x86_64-linux-gnu-gcc"))
+                    || exists(&format!("{d}/x86_64-unknown-linux-gnu-gcc"))
+            });
+        let has_aarch64 = (is_arm_arch(arch) && has_native)
+            || GCC_DIRS.iter().any(|d| {
+                exists(&format!("{d}/aarch64-linux-gnu-gcc"))
+                    || exists(&format!("{d}/aarch64-unknown-linux-gnu-gcc"))
+            });
+
+        if has_native || has_rva23 || has_x100 || has_a100 || has_x86_64 || has_aarch64 {
+            Self::push_unique_toolchain(toolchains, "gcc-17");
+        }
+        for (present, token) in [
+            (has_native, "gcc-17-native"),
+            (has_rva23, "gcc-17-rva23"),
+            (has_x100, "gcc-17-spacemit-x100"),
+            (has_a100, "gcc-17-spacemit-a100"),
+            (has_x86_64, "gcc-17-x86_64"),
+            (has_aarch64, "gcc-17-aarch64"),
+        ] {
+            if present {
+                Self::push_unique_toolchain(toolchains, token);
+            }
+        }
     }
 
     pub fn max_threads(&self) -> u32 {
@@ -1669,5 +1792,88 @@ mod tests {
             WorkerConfig::detect_rustc_bin_with_env(|k| env_map.get(k).cloned()),
             PathBuf::from("/custom/mu/rustc")
         );
+    }
+}
+
+#[cfg(test)]
+mod toolchain_discovery_tests {
+    use super::WorkerConfig;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_detect_toolchains_unified_multi_arch() {
+        let paths: HashSet<&str> = [
+            "/opt/llvm-24/bin/clang",
+            "/opt/llvm-24/bin/riscv64-rva23-linux-gnu-clang",
+            "/opt/llvm-24/bin/riscv64-spacemit-x100-linux-gnu-clang",
+            "/opt/llvm-24/bin/riscv64-spacemit-a100-linux-gnu-clang",
+            "/opt/llvm-24/bin/x86_64-linux-gnu-clang",
+            "/opt/llvm-24/bin/aarch64-linux-gnu-clang",
+            "/opt/gcc-17/bin/gcc",
+            "/opt/gcc-17/bin/riscv64-rva23-linux-gnu-gcc",
+            "/opt/gcc-17/bin/riscv64-spacemit-x100-linux-gnu-gcc",
+            "/opt/gcc-17/bin/riscv64-spacemit-a100-linux-gnu-gcc",
+            "/opt/gcc-17/bin/x86_64-linux-gnu-gcc",
+            "/opt/gcc-17/bin/aarch64-linux-gnu-gcc",
+        ]
+        .into_iter()
+        .collect();
+
+        let detected = WorkerConfig::detect_toolchains_with_probe("riscv64", |p| paths.contains(p));
+        for expected in [
+            "system",
+            "llvm-24",
+            "llvm-24-native",
+            "llvm-24-rva23",
+            "llvm-24-spacemit-x100",
+            "llvm-24-spacemit-a100",
+            "llvm-24-x86_64",
+            "llvm-24-aarch64",
+            "gcc-17",
+            "gcc-17-native",
+            "gcc-17-rva23",
+            "gcc-17-spacemit-x100",
+            "gcc-17-spacemit-a100",
+            "gcc-17-x86_64",
+            "gcc-17-aarch64",
+        ] {
+            assert!(
+                detected.iter().any(|t| t == expected),
+                "Missing expected toolchain '{expected}' in {detected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_toolchains_legacy_x100_still_advertises_gcc17_and_x100() {
+        let paths: HashSet<&str> = [
+            "/opt/cross-llvm-24/bin/clang",
+            "/opt/cross-gcc-17/bin/riscv64-unknown-linux-gnu-gcc",
+        ]
+        .into_iter()
+        .collect();
+        let detected = WorkerConfig::detect_toolchains_with_probe("x86_64", |p| paths.contains(p));
+        assert!(detected.contains(&"llvm-24".to_string()));
+        assert!(detected.contains(&"gcc-17".to_string()));
+        assert!(detected.contains(&"gcc-17-rva23".to_string()));
+        assert!(detected.contains(&"gcc-17-spacemit-x100".to_string()));
+    }
+
+    #[test]
+    fn test_detect_toolchains_empty_and_arch_native() {
+        let empty = WorkerConfig::detect_toolchains_with_probe("aarch64", |_| false);
+        assert_eq!(empty, vec!["system"]);
+
+        let arm_native: HashSet<&str> = ["/opt/llvm-24/bin/clang", "/opt/gcc-17/bin/gcc"]
+            .into_iter()
+            .collect();
+        let detected =
+            WorkerConfig::detect_toolchains_with_probe("aarch64", |p| arm_native.contains(p));
+        assert!(detected.contains(&"llvm-24-native".to_string()));
+        assert!(detected.contains(&"llvm-24-aarch64".to_string()));
+        assert!(!detected.contains(&"llvm-24-x86_64".to_string()));
+        assert!(detected.contains(&"gcc-17-native".to_string()));
+        assert!(detected.contains(&"gcc-17-aarch64".to_string()));
+        assert!(!detected.contains(&"gcc-17-x86_64".to_string()));
     }
 }
