@@ -1551,138 +1551,210 @@ impl StageRunner {
         task: &StageDispatchTask,
         base_path: &str,
     ) -> Vec<(&'static str, String)> {
-        let mut envs = Vec::new();
-        let is_cross = self.config.arch != "riscv64";
+        self.compute_toolchain_env_with(task, base_path, |p| Path::new(p).exists())
+    }
 
-        match task.toolchain.as_deref() {
-            Some("llvm-24") => {
-                let llvm_bin = if Path::new("/opt/llvm-24-spacemit-x100/bin").exists() {
-                    "/opt/llvm-24-spacemit-x100/bin"
-                } else if Path::new("/home/lma1980/opt/llvm-24/bin").exists() {
-                    "/home/lma1980/opt/llvm-24/bin"
-                } else {
-                    "/opt/cross-llvm-24/bin"
-                };
-                let gcc_bin = if Path::new("/opt/gcc-17-spacemit-x100/bin").exists() {
-                    Some("/opt/gcc-17-spacemit-x100/bin")
-                } else if Path::new("/home/lma1980/opt/gcc-17-spacemit-x100/bin").exists() {
-                    Some("/home/lma1980/opt/gcc-17-spacemit-x100/bin")
-                } else if Path::new("/opt/cross-gcc-17/bin").exists() {
-                    Some("/opt/cross-gcc-17/bin")
-                } else {
-                    None
-                };
-                let path_val = if let Some(gcc) = gcc_bin {
-                    format!("{}:{}:{}", llvm_bin, gcc, base_path)
-                } else {
-                    format!("{}:{}", llvm_bin, base_path)
-                };
-                envs.push(("PATH", path_val));
-                if is_cross {
-                    envs.push((
-                        "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS",
-                        "-C target-feature=+v -C target-cpu=spacemit-x100 -C link-arg=--target=riscv64-linux-gnu -C link-arg=--sysroot=/ -C link-arg=-fuse-ld=lld".to_string(),
-                    ));
-                    envs.push((
-                        "CARGO_BUILD_TARGET",
-                        "riscv64gc-unknown-linux-gnu".to_string(),
-                    ));
-                    envs.push((
-                        "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER",
-                        "clang".to_string(),
-                    ));
-                    envs.push(("CC_riscv64gc_unknown_linux_gnu", "clang".to_string()));
-                    envs.push(("CXX_riscv64gc_unknown_linux_gnu", "clang++".to_string()));
-                    envs.push((
-                        "CFLAGS_riscv64gc_unknown_linux_gnu",
-                        "--target=riscv64-linux-gnu --sysroot=/ -mcpu=spacemit-x100 -march=rv64gcv -mabi=lp64d".to_string(),
-                    ));
-                    envs.push((
-                        "CXXFLAGS_riscv64gc_unknown_linux_gnu",
-                        "--target=riscv64-linux-gnu --sysroot=/ -mcpu=spacemit-x100 -march=rv64gcv -mabi=lp64d".to_string(),
-                    ));
-                    info!(
-                        toolchain = "llvm-24",
-                        arch = %self.config.arch,
-                        "Injected cross-compile LLVM 24 environment targeting riscv64gc-unknown-linux-gnu (RVV 1.0 + spacemit-x100)"
-                    );
-                } else {
-                    envs.push((
-                        "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS",
-                        "-C target-feature=+v -C target-cpu=spacemit-x100".to_string(),
-                    ));
-                    envs.push(("CC", "clang".to_string()));
-                    envs.push(("CXX", "clang++".to_string()));
-                    envs.push((
-                        "RUSTFLAGS",
-                        "-C target-feature=+v -C target-cpu=spacemit-x100".to_string(),
-                    ));
-                    info!(
-                        toolchain = "llvm-24",
-                        "Injected native LLVM 24 environment with RVV 1.0 flags"
-                    );
-                }
+    fn compute_toolchain_env_with<F>(
+        &self,
+        task: &StageDispatchTask,
+        base_path: &str,
+        mut exists: F,
+    ) -> Vec<(&'static str, String)>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let Some(name) = task.toolchain.as_deref() else {
+            return Vec::new();
+        };
+        let Some((family, target_spec)) = parse_toolchain_spec(name, &self.config.arch) else {
+            return Vec::new();
+        };
+
+        let meta = target_spec.metadata();
+        let host_norm = normalize_host_arch(&self.config.arch);
+        let is_cross = host_norm != meta.arch_norm;
+        let sysroot_dir = format!("/opt/sysroots/{}", meta.gnu_triple);
+        let sysroot = if exists(&sysroot_dir) {
+            sysroot_dir
+        } else {
+            "/".to_string()
+        };
+
+        match family {
+            ToolchainFamily::Llvm24 => {
+                self.build_llvm24_toolchain_env(name, meta, is_cross, &sysroot, base_path, exists)
             }
-            Some("gcc-17") | Some("gcc-17-spacemit-x100") => {
-                let gcc_bin = if Path::new("/opt/gcc-17-spacemit-x100/bin").exists() {
-                    "/opt/gcc-17-spacemit-x100/bin"
-                } else if Path::new("/home/lma1980/opt/gcc-17-spacemit-x100/bin").exists() {
-                    "/home/lma1980/opt/gcc-17-spacemit-x100/bin"
-                } else if Path::new("/home/lma1980/opt/gcc-17/bin").exists() {
-                    "/home/lma1980/opt/gcc-17/bin"
-                } else {
-                    "/opt/cross-gcc-17/bin"
-                };
-                envs.push(("PATH", format!("{}:{}", gcc_bin, base_path)));
-                envs.push((
-                    "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS",
-                    "-C target-feature=+v -C target-cpu=spacemit-x100".to_string(),
-                ));
-                if is_cross {
-                    envs.push((
-                        "CARGO_BUILD_TARGET",
-                        "riscv64gc-unknown-linux-gnu".to_string(),
-                    ));
-                    envs.push((
-                        "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER",
-                        "riscv64-unknown-linux-gnu-gcc".to_string(),
-                    ));
-                    envs.push((
-                        "CC_riscv64gc_unknown_linux_gnu",
-                        "riscv64-unknown-linux-gnu-gcc".to_string(),
-                    ));
-                    envs.push((
-                        "CXX_riscv64gc_unknown_linux_gnu",
-                        "riscv64-unknown-linux-gnu-g++".to_string(),
-                    ));
-                    envs.push((
-                        "CFLAGS_riscv64gc_unknown_linux_gnu",
-                        "-mcpu=spacemit-x100 -march=rv64gcv -mabi=lp64d".to_string(),
-                    ));
-                    envs.push((
-                        "CXXFLAGS_riscv64gc_unknown_linux_gnu",
-                        "-mcpu=spacemit-x100 -march=rv64gcv -mabi=lp64d".to_string(),
-                    ));
-                } else {
-                    envs.push(("CC", "riscv64-unknown-linux-gnu-gcc".to_string()));
-                    envs.push(("CXX", "riscv64-unknown-linux-gnu-g++".to_string()));
-                    envs.push((
-                        "CFLAGS",
-                        "-mcpu=spacemit-x100 -march=rv64gcv -mabi=lp64d".to_string(),
-                    ));
-                    envs.push((
-                        "CXXFLAGS",
-                        "-mcpu=spacemit-x100 -march=rv64gcv -mabi=lp64d".to_string(),
-                    ));
-                }
-                info!(
-                    toolchain = "gcc-17",
-                    arch = %self.config.arch,
-                    "Injected GCC 17 environment with SpacemiT X100 flags"
-                );
+            ToolchainFamily::Gcc17 => {
+                self.build_gcc17_toolchain_env(name, meta, is_cross, &sysroot, base_path, exists)
             }
-            _ => {}
         }
+    }
+
+    fn build_llvm24_toolchain_env<F>(
+        &self,
+        name: &str,
+        meta: TargetMetadata,
+        is_cross: bool,
+        sysroot: &str,
+        base_path: &str,
+        mut exists: F,
+    ) -> Vec<(&'static str, String)>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        const LLVM_DIRS: [&str; 5] = [
+            "/opt/llvm-24/bin",
+            "/opt/llvm-24-spacemit-x100/bin",
+            "/opt/llvm-24-spacemit-a100/bin",
+            "/home/lma1980/opt/llvm-24/bin",
+            "/opt/cross-llvm-24/bin",
+        ];
+        const GCC_DIRS: [&str; 6] = [
+            "/opt/gcc-17/bin",
+            "/opt/gcc-17-spacemit-x100/bin",
+            "/opt/gcc-17-spacemit-a100/bin",
+            "/home/lma1980/opt/gcc-17-spacemit-x100/bin",
+            "/home/lma1980/opt/gcc-17/bin",
+            "/opt/cross-gcc-17/bin",
+        ];
+
+        let mut envs = Vec::new();
+        let llvm_bin = LLVM_DIRS
+            .iter()
+            .copied()
+            .find(|d| exists(d))
+            .unwrap_or("/opt/cross-llvm-24/bin");
+        let gcc_bin = GCC_DIRS.iter().copied().find(|d| exists(d));
+        let path_val = if let Some(gcc) = gcc_bin {
+            format!("{llvm_bin}:{gcc}:{base_path}")
+        } else {
+            format!("{llvm_bin}:{base_path}")
+        };
+        envs.push(("PATH", path_val));
+
+        if is_cross {
+            let link_args = format!(
+                "-C link-arg=--target={} -C link-arg=--sysroot={} -C link-arg=-fuse-ld=lld",
+                meta.gnu_triple, sysroot
+            );
+            let target_rustflags = if meta.rust_arch_flags.is_empty() {
+                link_args
+            } else {
+                format!("{} {}", meta.rust_arch_flags, link_args)
+            };
+            let c_flags = format!(
+                "--target={} --sysroot={} {}",
+                meta.gnu_triple, sysroot, meta.c_arch_flags
+            )
+            .trim()
+            .to_string();
+
+            envs.push((meta.env_target_rustflags, target_rustflags));
+            envs.push(("CARGO_BUILD_TARGET", meta.rust_triple.to_string()));
+            envs.push((meta.env_target_linker, "clang".to_string()));
+            envs.push((meta.env_cc_target, "clang".to_string()));
+            envs.push((meta.env_cxx_target, "clang++".to_string()));
+            envs.push((meta.env_cflags_target, c_flags.clone()));
+            envs.push((meta.env_cxxflags_target, c_flags));
+            info!(
+                toolchain = name,
+                host_arch = %self.config.arch,
+                target = meta.rust_triple,
+                sysroot = %sysroot,
+                "Injected cross-compile LLVM 24 environment"
+            );
+        } else {
+            if !meta.rust_arch_flags.is_empty() {
+                envs.push((meta.env_target_rustflags, meta.rust_arch_flags.to_string()));
+                envs.push(("RUSTFLAGS", meta.rust_arch_flags.to_string()));
+            }
+            envs.push(("CC", "clang".to_string()));
+            envs.push(("CXX", "clang++".to_string()));
+            if !meta.c_arch_flags.is_empty() {
+                envs.push(("CFLAGS", meta.c_arch_flags.to_string()));
+                envs.push(("CXXFLAGS", meta.c_arch_flags.to_string()));
+            }
+            info!(
+                toolchain = name,
+                host_arch = %self.config.arch,
+                "Injected native LLVM 24 environment"
+            );
+        }
+        envs
+    }
+
+    fn build_gcc17_toolchain_env<F>(
+        &self,
+        name: &str,
+        meta: TargetMetadata,
+        is_cross: bool,
+        sysroot: &str,
+        base_path: &str,
+        mut exists: F,
+    ) -> Vec<(&'static str, String)>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        const GCC_DIRS: [&str; 6] = [
+            "/opt/gcc-17/bin",
+            "/opt/gcc-17-spacemit-x100/bin",
+            "/opt/gcc-17-spacemit-a100/bin",
+            "/home/lma1980/opt/gcc-17-spacemit-x100/bin",
+            "/home/lma1980/opt/gcc-17/bin",
+            "/opt/cross-gcc-17/bin",
+        ];
+
+        let mut envs = Vec::new();
+        let gcc_bin = GCC_DIRS
+            .iter()
+            .copied()
+            .find(|d| exists(d))
+            .unwrap_or("/opt/cross-gcc-17/bin");
+        envs.push(("PATH", format!("{gcc_bin}:{base_path}")));
+
+        if is_cross {
+            let target_rustflags = if sysroot == "/" {
+                meta.rust_arch_flags.to_string()
+            } else if meta.rust_arch_flags.is_empty() {
+                format!("-C link-arg=--sysroot={sysroot}")
+            } else {
+                format!("{} -C link-arg=--sysroot={sysroot}", meta.rust_arch_flags)
+            };
+            if !target_rustflags.is_empty() {
+                envs.push((meta.env_target_rustflags, target_rustflags));
+            }
+            let c_flags = if sysroot == "/" {
+                meta.c_arch_flags.to_string()
+            } else {
+                format!("--sysroot={sysroot} {}", meta.c_arch_flags)
+                    .trim()
+                    .to_string()
+            };
+            envs.push(("CARGO_BUILD_TARGET", meta.rust_triple.to_string()));
+            envs.push((meta.env_target_linker, meta.gcc_driver.to_string()));
+            envs.push((meta.env_cc_target, meta.gcc_driver.to_string()));
+            envs.push((meta.env_cxx_target, meta.gxx_driver.to_string()));
+            if !c_flags.is_empty() {
+                envs.push((meta.env_cflags_target, c_flags.clone()));
+                envs.push((meta.env_cxxflags_target, c_flags));
+            }
+        } else {
+            if !meta.rust_arch_flags.is_empty() {
+                envs.push((meta.env_target_rustflags, meta.rust_arch_flags.to_string()));
+            }
+            envs.push(("CC", meta.gcc_driver.to_string()));
+            envs.push(("CXX", meta.gxx_driver.to_string()));
+            if !meta.c_arch_flags.is_empty() {
+                envs.push(("CFLAGS", meta.c_arch_flags.to_string()));
+                envs.push(("CXXFLAGS", meta.c_arch_flags.to_string()));
+            }
+        }
+        info!(
+            toolchain = name,
+            host_arch = %self.config.arch,
+            target = meta.rust_triple,
+            "Injected GCC 17 environment"
+        );
         envs
     }
 
@@ -2957,11 +3029,19 @@ allow_spacemit_ai_thread: false
                 .map(String::as_str),
             Some("clang")
         );
+        let expected_sysroot = if Path::new("/opt/sysroots/riscv64-linux-gnu").exists() {
+            "/opt/sysroots/riscv64-linux-gnu"
+        } else {
+            "/"
+        };
+        let expected_rustflags = format!(
+            "-C target-feature=+v -C target-cpu=spacemit-x100 -C link-arg=--target=riscv64-linux-gnu -C link-arg=--sysroot={expected_sysroot} -C link-arg=-fuse-ld=lld"
+        );
         assert_eq!(
             cross_envs
                 .get("CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS")
                 .map(String::as_str),
-            Some("-C target-feature=+v -C target-cpu=spacemit-x100 -C link-arg=--target=riscv64-linux-gnu -C link-arg=--sysroot=/ -C link-arg=-fuse-ld=lld")
+            Some(expected_rustflags.as_str())
         );
         // Host RUSTFLAGS must not be set on x86_64 cross-builds so host build.rs/proc-macros compile cleanly
         assert!(!cross_envs.contains_key("RUSTFLAGS"));
@@ -3745,6 +3825,315 @@ allow_spacemit_ai_thread: false
         assert!(
             !ws_dir.exists(),
             "disabled tool must be rejected before workspace creation"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolchainFamily {
+    Llvm24,
+    Gcc17,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetSpec {
+    Riscv64Rva23,
+    Riscv64SpacemitX100,
+    Riscv64SpacemitA100,
+    X86_64,
+    Aarch64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TargetMetadata {
+    arch_norm: &'static str,
+    rust_triple: &'static str,
+    gnu_triple: &'static str,
+    gcc_driver: &'static str,
+    gxx_driver: &'static str,
+    c_arch_flags: &'static str,
+    rust_arch_flags: &'static str,
+    env_target_linker: &'static str,
+    env_target_rustflags: &'static str,
+    env_cc_target: &'static str,
+    env_cxx_target: &'static str,
+    env_cflags_target: &'static str,
+    env_cxxflags_target: &'static str,
+}
+
+impl TargetSpec {
+    const fn metadata(self) -> TargetMetadata {
+        match self {
+            Self::Riscv64Rva23 => TargetMetadata {
+                arch_norm: "riscv64",
+                rust_triple: "riscv64a23-unknown-linux-gnu",
+                gnu_triple: "riscv64-linux-gnu",
+                gcc_driver: "riscv64-unknown-linux-gnu-gcc",
+                gxx_driver: "riscv64-unknown-linux-gnu-g++",
+                c_arch_flags: "-march=rva23u64 -mabi=lp64d",
+                rust_arch_flags: "-C target-feature=+rva23u64",
+                env_target_linker: "CARGO_TARGET_RISCV64A23_UNKNOWN_LINUX_GNU_LINKER",
+                env_target_rustflags: "CARGO_TARGET_RISCV64A23_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                env_cc_target: "CC_riscv64a23_unknown_linux_gnu",
+                env_cxx_target: "CXX_riscv64a23_unknown_linux_gnu",
+                env_cflags_target: "CFLAGS_riscv64a23_unknown_linux_gnu",
+                env_cxxflags_target: "CXXFLAGS_riscv64a23_unknown_linux_gnu",
+            },
+            Self::Riscv64SpacemitX100 => TargetMetadata {
+                arch_norm: "riscv64",
+                rust_triple: "riscv64gc-unknown-linux-gnu",
+                gnu_triple: "riscv64-linux-gnu",
+                gcc_driver: "riscv64-unknown-linux-gnu-gcc",
+                gxx_driver: "riscv64-unknown-linux-gnu-g++",
+                c_arch_flags: "-mcpu=spacemit-x100 -mabi=lp64d",
+                rust_arch_flags: "-C target-feature=+v -C target-cpu=spacemit-x100",
+                env_target_linker: "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER",
+                env_target_rustflags: "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                env_cc_target: "CC_riscv64gc_unknown_linux_gnu",
+                env_cxx_target: "CXX_riscv64gc_unknown_linux_gnu",
+                env_cflags_target: "CFLAGS_riscv64gc_unknown_linux_gnu",
+                env_cxxflags_target: "CXXFLAGS_riscv64gc_unknown_linux_gnu",
+            },
+            Self::Riscv64SpacemitA100 => TargetMetadata {
+                arch_norm: "riscv64",
+                rust_triple: "riscv64gc-unknown-linux-gnu",
+                gnu_triple: "riscv64-linux-gnu",
+                gcc_driver: "riscv64-unknown-linux-gnu-gcc",
+                gxx_driver: "riscv64-unknown-linux-gnu-g++",
+                c_arch_flags: "-mcpu=spacemit-a100 -mabi=lp64d",
+                rust_arch_flags: "-C target-feature=+v -C target-cpu=spacemit-a100",
+                env_target_linker: "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER",
+                env_target_rustflags: "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                env_cc_target: "CC_riscv64gc_unknown_linux_gnu",
+                env_cxx_target: "CXX_riscv64gc_unknown_linux_gnu",
+                env_cflags_target: "CFLAGS_riscv64gc_unknown_linux_gnu",
+                env_cxxflags_target: "CXXFLAGS_riscv64gc_unknown_linux_gnu",
+            },
+            Self::X86_64 => TargetMetadata {
+                arch_norm: "x86_64",
+                rust_triple: "x86_64-unknown-linux-gnu",
+                gnu_triple: "x86_64-linux-gnu",
+                gcc_driver: "x86_64-linux-gnu-gcc",
+                gxx_driver: "x86_64-linux-gnu-g++",
+                c_arch_flags: "-march=x86-64",
+                rust_arch_flags: "",
+                env_target_linker: "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+                env_target_rustflags: "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                env_cc_target: "CC_x86_64_unknown_linux_gnu",
+                env_cxx_target: "CXX_x86_64_unknown_linux_gnu",
+                env_cflags_target: "CFLAGS_x86_64_unknown_linux_gnu",
+                env_cxxflags_target: "CXXFLAGS_x86_64_unknown_linux_gnu",
+            },
+            Self::Aarch64 => TargetMetadata {
+                arch_norm: "aarch64",
+                rust_triple: "aarch64-unknown-linux-gnu",
+                gnu_triple: "aarch64-linux-gnu",
+                gcc_driver: "aarch64-linux-gnu-gcc",
+                gxx_driver: "aarch64-linux-gnu-g++",
+                c_arch_flags: "-mcpu=cortex-a72",
+                rust_arch_flags: "-C target-cpu=cortex-a72",
+                env_target_linker: "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+                env_target_rustflags: "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                env_cc_target: "CC_aarch64_unknown_linux_gnu",
+                env_cxx_target: "CXX_aarch64_unknown_linux_gnu",
+                env_cflags_target: "CFLAGS_aarch64_unknown_linux_gnu",
+                env_cxxflags_target: "CXXFLAGS_aarch64_unknown_linux_gnu",
+            },
+        }
+    }
+}
+
+fn normalize_host_arch(arch: &str) -> &'static str {
+    match arch.trim().to_ascii_lowercase().as_str() {
+        "riscv64" | "riscv64gc" | "riscv64a23" => "riscv64",
+        "aarch64" | "arm64" => "aarch64",
+        _ => "x86_64",
+    }
+}
+
+fn native_target_for_host(host_arch: &str) -> TargetSpec {
+    match normalize_host_arch(host_arch) {
+        "riscv64" => TargetSpec::Riscv64Rva23,
+        "aarch64" => TargetSpec::Aarch64,
+        _ => TargetSpec::X86_64,
+    }
+}
+
+fn parse_toolchain_spec(name: &str, host_arch: &str) -> Option<(ToolchainFamily, TargetSpec)> {
+    match name {
+        "llvm-24" | "llvm-24-spacemit-x100" | "llvm-24-x100" => {
+            Some((ToolchainFamily::Llvm24, TargetSpec::Riscv64SpacemitX100))
+        }
+        "llvm-24-native" => Some((ToolchainFamily::Llvm24, native_target_for_host(host_arch))),
+        "llvm-24-rva23" => Some((ToolchainFamily::Llvm24, TargetSpec::Riscv64Rva23)),
+        "llvm-24-spacemit-a100" | "llvm-24-a100" => {
+            Some((ToolchainFamily::Llvm24, TargetSpec::Riscv64SpacemitA100))
+        }
+        "llvm-24-x86_64" => Some((ToolchainFamily::Llvm24, TargetSpec::X86_64)),
+        "llvm-24-aarch64" => Some((ToolchainFamily::Llvm24, TargetSpec::Aarch64)),
+        "gcc-17" | "gcc-17-spacemit-x100" | "gcc-17-x100" => {
+            Some((ToolchainFamily::Gcc17, TargetSpec::Riscv64SpacemitX100))
+        }
+        "gcc-17-native" => Some((ToolchainFamily::Gcc17, native_target_for_host(host_arch))),
+        "gcc-17-rva23" => Some((ToolchainFamily::Gcc17, TargetSpec::Riscv64Rva23)),
+        "gcc-17-spacemit-a100" | "gcc-17-a100" => {
+            Some((ToolchainFamily::Gcc17, TargetSpec::Riscv64SpacemitA100))
+        }
+        "gcc-17-x86_64" => Some((ToolchainFamily::Gcc17, TargetSpec::X86_64)),
+        "gcc-17-aarch64" => Some((ToolchainFamily::Gcc17, TargetSpec::Aarch64)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod multi_arch_toolchain_tests {
+    use super::*;
+    use crate::config::IsolationMode;
+    use std::collections::{HashMap, HashSet};
+    use tempfile::tempdir;
+
+    fn make_runner(arch: &str) -> (StageRunner, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let cfg = WorkerConfig {
+            controller_url: "ws://127.0.0.1:8000/api/cluster/tunnel".into(),
+            cluster_token: "test".into(),
+            node_id: format!("worker-{arch}"),
+            arch: arch.into(),
+            tags: vec![arch.into()],
+            max_slots: 1,
+            workspace_dir: dir.path().to_path_buf(),
+            toolchains: vec!["system".into()],
+            use_btrfs: false,
+            isolation_mode: IsolationMode::None,
+            rust_semver: None,
+        };
+        (StageRunner::new(cfg), dir)
+    }
+
+    fn run_env(
+        runner: &StageRunner,
+        tc: &str,
+        paths: &HashSet<&str>,
+    ) -> HashMap<&'static str, String> {
+        let task = StageDispatchTask {
+            job_id: "job-multi".into(),
+            stage_id: "build".into(),
+            toolchain: Some(tc.into()),
+            ..Default::default()
+        };
+        runner
+            .compute_toolchain_env_with(&task, "/usr/bin:/bin", |p| paths.contains(p))
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn test_cross_compile_all_to_all_targets_with_sysroots() {
+        let paths: HashSet<&str> = [
+            "/opt/llvm-24/bin",
+            "/opt/gcc-17/bin",
+            "/opt/sysroots/riscv64-linux-gnu",
+            "/opt/sysroots/x86_64-linux-gnu",
+            "/opt/sysroots/aarch64-linux-gnu",
+        ]
+        .into_iter()
+        .collect();
+
+        // riscv64 -> x86_64 (LLVM-24) and aarch64 (GCC-17)
+        let (riscv_runner, _d1) = make_runner("riscv64");
+        let x86_env = run_env(&riscv_runner, "llvm-24-x86_64", &paths);
+        assert_eq!(
+            x86_env.get("CARGO_BUILD_TARGET").map(String::as_str),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            x86_env
+                .get("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER")
+                .map(String::as_str),
+            Some("clang")
+        );
+        assert!(x86_env["CFLAGS_x86_64_unknown_linux_gnu"]
+            .contains("--sysroot=/opt/sysroots/x86_64-linux-gnu"));
+        assert!(!x86_env.contains_key("RUSTFLAGS"));
+
+        let arm_env = run_env(&riscv_runner, "gcc-17-aarch64", &paths);
+        assert_eq!(
+            arm_env.get("CARGO_BUILD_TARGET").map(String::as_str),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            arm_env
+                .get("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER")
+                .map(String::as_str),
+            Some("aarch64-linux-gnu-gcc")
+        );
+        assert!(arm_env["CFLAGS_aarch64_unknown_linux_gnu"]
+            .contains("--sysroot=/opt/sysroots/aarch64-linux-gnu"));
+        assert!(arm_env["CFLAGS_aarch64_unknown_linux_gnu"].contains("-mcpu=cortex-a72"));
+
+        // aarch64 -> riscv64 spacemit-a100 (riscv64gc) & rva23 (riscv64a23)
+        let (arm_runner, _d2) = make_runner("aarch64");
+        let a100_env = run_env(&arm_runner, "llvm-24-spacemit-a100", &paths);
+        assert_eq!(
+            a100_env.get("CARGO_BUILD_TARGET").map(String::as_str),
+            Some("riscv64gc-unknown-linux-gnu")
+        );
+        assert!(a100_env["CFLAGS_riscv64gc_unknown_linux_gnu"].contains("-mcpu=spacemit-a100"));
+        assert!(
+            a100_env["CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS"]
+                .contains("--sysroot=/opt/sysroots/riscv64-linux-gnu")
+        );
+
+        let rva23_env = run_env(&arm_runner, "gcc-17-rva23", &paths);
+        assert_eq!(
+            rva23_env.get("CARGO_BUILD_TARGET").map(String::as_str),
+            Some("riscv64a23-unknown-linux-gnu")
+        );
+        assert!(rva23_env["CFLAGS_riscv64a23_unknown_linux_gnu"].contains("-march=rva23u64"));
+        assert!(
+            rva23_env["CARGO_TARGET_RISCV64A23_UNKNOWN_LINUX_GNU_RUSTFLAGS"]
+                .contains("--sysroot=/opt/sysroots/riscv64-linux-gnu")
+        );
+
+        // Native x86_64 does not set CARGO_BUILD_TARGET
+        let (x86_runner, _d3) = make_runner("x86_64");
+        let native_env = run_env(&x86_runner, "gcc-17-native", &paths);
+        assert!(!native_env.contains_key("CARGO_BUILD_TARGET"));
+        assert_eq!(
+            native_env.get("CC").map(String::as_str),
+            Some("x86_64-linux-gnu-gcc")
+        );
+    }
+
+    #[test]
+    fn test_cross_compile_sysroot_fallback_to_root() {
+        let paths: HashSet<&str> = ["/opt/llvm-24/bin", "/opt/gcc-17/bin"]
+            .into_iter()
+            .collect();
+        let (x86_runner, _d) = make_runner("x86_64");
+
+        let llvm_env = run_env(&x86_runner, "llvm-24-rva23", &paths);
+        assert_eq!(
+            llvm_env.get("CARGO_BUILD_TARGET").map(String::as_str),
+            Some("riscv64a23-unknown-linux-gnu")
+        );
+        assert!(llvm_env["CFLAGS_riscv64a23_unknown_linux_gnu"].contains("--sysroot=/"));
+        assert!(
+            llvm_env["CARGO_TARGET_RISCV64A23_UNKNOWN_LINUX_GNU_RUSTFLAGS"]
+                .contains("-C link-arg=--sysroot=/")
+        );
+
+        let gcc_env = run_env(&x86_runner, "gcc-17-aarch64", &paths);
+        assert_eq!(
+            gcc_env.get("CARGO_BUILD_TARGET").map(String::as_str),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert!(!gcc_env["CFLAGS_aarch64_unknown_linux_gnu"].contains("--sysroot="));
+        assert_eq!(
+            gcc_env
+                .get("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
+                .map(String::as_str),
+            Some("-C target-cpu=cortex-a72")
         );
     }
 }
