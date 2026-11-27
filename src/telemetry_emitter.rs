@@ -787,12 +787,346 @@ fn hash_identifier(input: &str) -> u64 {
     }
 }
 
+/// Ambient parent CI stage execution context detected from child subprocess environment
+/// variables exported by [`crate::stage_runner::StageRunner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentCiContext {
+    pub job_id: String,
+    pub stage_id: String,
+    pub task_id: Option<String>,
+    pub node_id: Option<String>,
+    pub repo_name: Option<String>,
+    pub commit_sha: Option<String>,
+    pub trace_id: Option<String>,
+    pub stage_span_id: Option<String>,
+}
+
+impl ParentCiContext {
+    /// Detects parent CI context from process environment variables when running inside an
+    /// `ActionRunner` child stage (`ACTION_RUNNER == "true"` with non-empty `JOB_ID` and
+    /// `STAGE_ID`).
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Detects parent CI context using a custom environment lookup closure.
+    #[must_use]
+    pub fn from_lookup<F>(get_env: F) -> Option<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let is_action_runner = non_empty_lookup(&get_env, "ACTION_RUNNER")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if !is_action_runner {
+            return None;
+        }
+
+        let job_id = non_empty_lookup(&get_env, "JOB_ID")?;
+        let stage_id = non_empty_lookup(&get_env, "STAGE_ID")?;
+        let task_id = non_empty_lookup(&get_env, "TASK_ID");
+        let node_id = non_empty_lookup(&get_env, "ACTION_RUNNER_NODE_ID");
+        let repo_name = non_empty_lookup(&get_env, "GITHUB_REPOSITORY");
+        let commit_sha = non_empty_lookup(&get_env, "GITHUB_SHA");
+
+        let (trace_id, stage_span_id) = match non_empty_lookup(&get_env, "TRACEPARENT")
+            .and_then(|raw| TraceContext::parse_traceparent(&raw).ok())
+        {
+            Some(ctx) => (Some(ctx.trace_id_hex()), Some(ctx.span_id_hex())),
+            None => (None, None),
+        };
+
+        Some(Self {
+            job_id,
+            stage_id,
+            task_id,
+            node_id,
+            repo_name,
+            commit_sha,
+            trace_id,
+            stage_span_id,
+        })
+    }
+
+    /// Enriches child-emitted spans with parent W3C trace linkage, host node attribution,
+    /// and `ci_stage_child` execution-context metadata while preserving internal child
+    /// parent-child edges and simulated fixture attributes.
+    #[must_use]
+    pub fn enrich_spans(&self, spans: &[OtelSpanEntry]) -> Vec<OtelSpanEntry> {
+        let redactor = DeterministicSecretRedactor::new();
+        spans
+            .iter()
+            .cloned()
+            .map(|mut span| {
+                if let Some(ref parent_trace_id) = self.trace_id {
+                    span.trace_id = parent_trace_id.clone();
+                }
+                if span.parent_span_id.is_none() {
+                    if let Some(ref parent_stage_span_id) = self.stage_span_id {
+                        span.parent_span_id = Some(parent_stage_span_id.clone());
+                    }
+                }
+
+                let mut attrs = parse_attributes_object(&span.attributes_json);
+                if let Some(ref host_node_id) = self.node_id {
+                    if !span.node_id.is_empty() && span.node_id != *host_node_id {
+                        attrs
+                            .entry("fixture_node_id".to_string())
+                            .or_insert_with(|| serde_json::json!(span.node_id));
+                    }
+                    span.node_id = host_node_id.clone();
+                }
+
+                if let Some(child_job) = non_empty_attr(&attrs, "job_id") {
+                    if child_job != self.job_id {
+                        attrs
+                            .entry("fixture_job_id".to_string())
+                            .or_insert_with(|| serde_json::json!(child_job));
+                    }
+                }
+                attrs.insert("job_id".to_string(), serde_json::json!(self.job_id));
+
+                if let Some(child_stage) = non_empty_attr(&attrs, "stage_id") {
+                    if child_stage != self.stage_id {
+                        attrs
+                            .entry("fixture_stage_id".to_string())
+                            .or_insert_with(|| serde_json::json!(child_stage));
+                    }
+                }
+                attrs.insert("stage_id".to_string(), serde_json::json!(self.stage_id));
+
+                if let Some(ref parent_repo) = self.repo_name {
+                    if let Some(child_repo) = non_empty_attr(&attrs, "repo_name") {
+                        if child_repo != *parent_repo {
+                            attrs
+                                .entry("fixture_repo_name".to_string())
+                                .or_insert_with(|| serde_json::json!(child_repo));
+                        }
+                    }
+                    attrs.insert("repo_name".to_string(), serde_json::json!(parent_repo));
+                }
+
+                self.insert_execution_context_attrs(&mut attrs);
+                span.attributes_json = serde_json::Value::Object(attrs).to_string();
+                span.redact_in_place(&redactor);
+                span
+            })
+            .collect()
+    }
+
+    /// Enriches child-emitted log records with parent CI job/stage/trace association,
+    /// host node attribution, and `ci_stage_child` execution-context metadata.
+    #[must_use]
+    pub fn enrich_logs(&self, logs: &[OtelLogEntry]) -> Vec<OtelLogEntry> {
+        let redactor = DeterministicSecretRedactor::new();
+        logs.iter()
+            .cloned()
+            .map(|mut log| {
+                if let Some(ref parent_trace_id) = self.trace_id {
+                    log.trace_id = parent_trace_id.clone();
+                }
+
+                let mut attrs = parse_attributes_object(&log.attributes_json);
+                if let Some(ref host_node_id) = self.node_id {
+                    if !log.node_id.is_empty() && log.node_id != *host_node_id {
+                        attrs
+                            .entry("fixture_node_id".to_string())
+                            .or_insert_with(|| serde_json::json!(log.node_id));
+                    }
+                    log.node_id = host_node_id.clone();
+                }
+
+                let child_job = log
+                    .job_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| non_empty_attr(&attrs, "job_id"));
+                if let Some(child_job) = child_job {
+                    if child_job != self.job_id {
+                        attrs
+                            .entry("fixture_job_id".to_string())
+                            .or_insert_with(|| serde_json::json!(child_job));
+                    }
+                }
+                log.job_id = Some(self.job_id.clone());
+                if attrs.contains_key("job_id") {
+                    attrs.insert("job_id".to_string(), serde_json::json!(self.job_id));
+                }
+
+                let child_stage = log
+                    .stage_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| non_empty_attr(&attrs, "stage_id"));
+                if let Some(child_stage) = child_stage {
+                    if child_stage != self.stage_id {
+                        attrs
+                            .entry("fixture_stage_id".to_string())
+                            .or_insert_with(|| serde_json::json!(child_stage));
+                    }
+                }
+                log.stage_id = Some(self.stage_id.clone());
+                if attrs.contains_key("stage_id") {
+                    attrs.insert("stage_id".to_string(), serde_json::json!(self.stage_id));
+                }
+
+                if let Some(ref parent_repo) = self.repo_name {
+                    if let Some(child_repo) = non_empty_attr(&attrs, "repo_name") {
+                        if child_repo != *parent_repo {
+                            attrs
+                                .entry("fixture_repo_name".to_string())
+                                .or_insert_with(|| serde_json::json!(child_repo));
+                        }
+                        attrs.insert("repo_name".to_string(), serde_json::json!(parent_repo));
+                    }
+                }
+
+                self.insert_execution_context_attrs(&mut attrs);
+                log.attributes_json = serde_json::Value::Object(attrs).to_string();
+                log.redact_in_place(&redactor);
+                log
+            })
+            .collect()
+    }
+
+    /// Associates child-emitted [`TestCaseRunEntry`] records with the parent CI job,
+    /// repository, commit SHA, and host `node_id`.
+    #[must_use]
+    pub fn enrich_test_runs(&self, test_runs: &[TestCaseRunEntry]) -> Vec<TestCaseRunEntry> {
+        let parent_repo_key = self.repo_name.as_deref().map(normalize_repo_key);
+        test_runs
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                if let Some(ref host_node_id) = self.node_id {
+                    entry.node_id = host_node_id.clone();
+                }
+                entry.job_id = self.job_id.clone();
+                if let Some(ref repo_key) = parent_repo_key {
+                    entry.repo_key = repo_key.clone();
+                }
+                if let Some(ref commit_sha) = self.commit_sha {
+                    entry.commit_sha = commit_sha.clone();
+                }
+                entry
+            })
+            .collect()
+    }
+
+    /// Associates child-emitted [`BenchmarkRunEntry`] records with the parent CI job,
+    /// repository, commit SHA, and host `node_id`.
+    #[must_use]
+    pub fn enrich_benchmark_runs(
+        &self,
+        bench_runs: &[BenchmarkRunEntry],
+    ) -> Vec<BenchmarkRunEntry> {
+        let parent_repo_key = self.repo_name.as_deref().map(normalize_repo_key);
+        bench_runs
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                if let Some(ref host_node_id) = self.node_id {
+                    entry.node_id = host_node_id.clone();
+                }
+                entry.job_id = self.job_id.clone();
+                if let Some(ref repo_key) = parent_repo_key {
+                    entry.repo_key = repo_key.clone();
+                }
+                if let Some(ref commit_sha) = self.commit_sha {
+                    entry.commit_sha = commit_sha.clone();
+                }
+                entry
+            })
+            .collect()
+    }
+
+    fn insert_execution_context_attrs(
+        &self,
+        attrs: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        attrs.insert(
+            "execution_context".to_string(),
+            serde_json::json!("ci_stage_child"),
+        );
+        attrs.insert("parent_job_id".to_string(), serde_json::json!(self.job_id));
+        attrs.insert(
+            "parent_stage_id".to_string(),
+            serde_json::json!(self.stage_id),
+        );
+        if let Some(ref task_id) = self.task_id {
+            attrs.insert("parent_task_id".to_string(), serde_json::json!(task_id));
+        }
+        if let Some(ref repo_name) = self.repo_name {
+            attrs.insert("parent_repo_name".to_string(), serde_json::json!(repo_name));
+        }
+        if let Some(ref commit_sha) = self.commit_sha {
+            attrs.insert(
+                "parent_commit_sha".to_string(),
+                serde_json::json!(commit_sha),
+            );
+        }
+        if let Some(ref trace_id) = self.trace_id {
+            attrs.insert("parent_trace_id".to_string(), serde_json::json!(trace_id));
+        }
+        if let Some(ref stage_span_id) = self.stage_span_id {
+            attrs.insert(
+                "parent_stage_span_id".to_string(),
+                serde_json::json!(stage_span_id),
+            );
+        }
+    }
+}
+
+fn non_empty_lookup<F>(get_env: &F, key: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env(key)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_attributes_object(raw: &str) -> serde_json::Map<String, serde_json::Value> {
+    if raw.trim().is_empty() {
+        return serde_json::Map::new();
+    }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn non_empty_attr(attrs: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    attrs
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+fn maybe_enrich<'a, T: Clone>(
+    items: &'a [T],
+    ctx: Option<&ParentCiContext>,
+    enrich: impl FnOnce(&ParentCiContext, &[T]) -> Vec<T>,
+) -> std::borrow::Cow<'a, [T]> {
+    match ctx {
+        Some(c) => std::borrow::Cow::Owned(enrich(c, items)),
+        None => std::borrow::Cow::Borrowed(items),
+    }
+}
+
 /// Asynchronous client emitting `MUOB`-framed Apache Arrow telemetry batches to the local
 /// `MuObserve-collector` daemon.
 #[derive(Debug, Clone)]
 pub struct TelemetryEmitter {
     collector_addr: String,
     connect_timeout: Duration,
+    parent_context: Option<ParentCiContext>,
 }
 
 impl Default for TelemetryEmitter {
@@ -808,11 +1142,13 @@ impl TelemetryEmitter {
         Self {
             collector_addr: collector_addr.into(),
             connect_timeout: Duration::from_millis(250),
+            parent_context: None,
         }
     }
 
     /// Creates a [`TelemetryEmitter`] resolved from `MUOBSERVE_COLLECTOR_ADDR` or
-    /// [`DEFAULT_COLLECTOR_MUOB_ADDR`].
+    /// [`DEFAULT_COLLECTOR_MUOB_ADDR`], automatically wiring [`ParentCiContext::from_env()`]
+    /// when running inside a child CI stage.
     #[must_use]
     pub fn from_env() -> Self {
         let addr = std::env::var("MUOBSERVE_COLLECTOR_ADDR")
@@ -820,7 +1156,20 @@ impl TelemetryEmitter {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_COLLECTOR_MUOB_ADDR.to_string());
-        Self::new(addr)
+        Self::new(addr).with_parent_context(ParentCiContext::from_env())
+    }
+
+    /// Attaches or clears an explicit [`ParentCiContext`] for telemetry attribution.
+    #[must_use]
+    pub fn with_parent_context(mut self, parent_context: Option<ParentCiContext>) -> Self {
+        self.parent_context = parent_context;
+        self
+    }
+
+    /// Returns the attached [`ParentCiContext`], if any.
+    #[must_use]
+    pub fn parent_context(&self) -> Option<&ParentCiContext> {
+        self.parent_context.as_ref()
     }
 
     /// Overrides the connection/write timeout.
@@ -841,7 +1190,12 @@ impl TelemetryEmitter {
         if spans.is_empty() {
             return Ok(0);
         }
-        let payload = encode_span_batch(spans).map_err(|e| e.to_string())?;
+        let enriched = maybe_enrich(
+            spans,
+            self.parent_context.as_ref(),
+            ParentCiContext::enrich_spans,
+        );
+        let payload = encode_span_batch(enriched.as_ref()).map_err(|e| e.to_string())?;
         self.send_muob_frames(&[(MSG_TYPE_ARROW_OTEL_SPANS, 0, payload)])
             .await
     }
@@ -851,9 +1205,14 @@ impl TelemetryEmitter {
         if logs.is_empty() {
             return Ok(0);
         }
-        let high_prio = logs.iter().any(|l| l.severity_number >= 13);
+        let enriched = maybe_enrich(
+            logs,
+            self.parent_context.as_ref(),
+            ParentCiContext::enrich_logs,
+        );
+        let high_prio = enriched.iter().any(|l| l.severity_number >= 13);
         let flags = if high_prio { FLAG_HIGH_PRIORITY } else { 0 };
-        let payload = encode_log_batch(logs).map_err(|e| e.to_string())?;
+        let payload = encode_log_batch(enriched.as_ref()).map_err(|e| e.to_string())?;
         self.send_muob_frames(&[(MSG_TYPE_ARROW_OTEL_LOGS, flags, payload)])
             .await
     }
@@ -863,7 +1222,12 @@ impl TelemetryEmitter {
         if test_runs.is_empty() {
             return Ok(0);
         }
-        let payload = encode_test_run_batch(test_runs).map_err(|e| e.to_string())?;
+        let enriched = maybe_enrich(
+            test_runs,
+            self.parent_context.as_ref(),
+            ParentCiContext::enrich_test_runs,
+        );
+        let payload = encode_test_run_batch(enriched.as_ref()).map_err(|e| e.to_string())?;
         self.send_muob_frames(&[(MSG_TYPE_ARROW_TEST_RUNS, 0, payload)])
             .await
     }
@@ -876,7 +1240,12 @@ impl TelemetryEmitter {
         if bench_runs.is_empty() {
             return Ok(0);
         }
-        let payload = encode_benchmark_run_batch(bench_runs).map_err(|e| e.to_string())?;
+        let enriched = maybe_enrich(
+            bench_runs,
+            self.parent_context.as_ref(),
+            ParentCiContext::enrich_benchmark_runs,
+        );
+        let payload = encode_benchmark_run_batch(enriched.as_ref()).map_err(|e| e.to_string())?;
         self.send_muob_frames(&[(MSG_TYPE_ARROW_BENCH_RUNS, 0, payload)])
             .await
     }
@@ -894,22 +1263,28 @@ impl TelemetryEmitter {
         bench_runs: &[BenchmarkRunEntry],
     ) -> Result<u64, String> {
         let mut frames = Vec::new();
+        let ctx = self.parent_context.as_ref();
         if !spans.is_empty() {
-            let payload = encode_span_batch(spans).map_err(|e| e.to_string())?;
+            let enriched = maybe_enrich(spans, ctx, ParentCiContext::enrich_spans);
+            let payload = encode_span_batch(enriched.as_ref()).map_err(|e| e.to_string())?;
             frames.push((MSG_TYPE_ARROW_OTEL_SPANS, 0u32, payload));
         }
         if !logs.is_empty() {
-            let high_prio = logs.iter().any(|l| l.severity_number >= 13);
+            let enriched = maybe_enrich(logs, ctx, ParentCiContext::enrich_logs);
+            let high_prio = enriched.iter().any(|l| l.severity_number >= 13);
             let flags = if high_prio { FLAG_HIGH_PRIORITY } else { 0 };
-            let payload = encode_log_batch(logs).map_err(|e| e.to_string())?;
+            let payload = encode_log_batch(enriched.as_ref()).map_err(|e| e.to_string())?;
             frames.push((MSG_TYPE_ARROW_OTEL_LOGS, flags, payload));
         }
         if !test_runs.is_empty() {
-            let payload = encode_test_run_batch(test_runs).map_err(|e| e.to_string())?;
+            let enriched = maybe_enrich(test_runs, ctx, ParentCiContext::enrich_test_runs);
+            let payload = encode_test_run_batch(enriched.as_ref()).map_err(|e| e.to_string())?;
             frames.push((MSG_TYPE_ARROW_TEST_RUNS, 0u32, payload));
         }
         if !bench_runs.is_empty() {
-            let payload = encode_benchmark_run_batch(bench_runs).map_err(|e| e.to_string())?;
+            let enriched = maybe_enrich(bench_runs, ctx, ParentCiContext::enrich_benchmark_runs);
+            let payload =
+                encode_benchmark_run_batch(enriched.as_ref()).map_err(|e| e.to_string())?;
             frames.push((MSG_TYPE_ARROW_BENCH_RUNS, 0u32, payload));
         }
 
@@ -1446,5 +1821,511 @@ mod tests {
 
         let decoded_benches = decode_benchmark_run_batch(&frames[3].1).expect("decode benches");
         assert_eq!(decoded_benches, bench_runs);
+    }
+
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ScopedEnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl ScopedEnvGuard {
+        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let mut saved = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                saved.push((*k, std::env::var(k).ok()));
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedEnvGuard {
+        fn drop(&mut self) {
+            for (k, prev) in self.saved.drain(..).rev() {
+                match prev {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_parent_ci_context_from_env_activation_and_parsing() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Missing ACTION_RUNNER -> None
+        {
+            let _guard = ScopedEnvGuard::set(&[
+                ("ACTION_RUNNER", None),
+                ("JOB_ID", Some("job-1")),
+                ("STAGE_ID", Some("stage-1")),
+            ]);
+            assert!(ParentCiContext::from_env().is_none());
+        }
+
+        // ACTION_RUNNER != "true" or empty JOB_ID / STAGE_ID -> None
+        {
+            let _guard = ScopedEnvGuard::set(&[
+                ("ACTION_RUNNER", Some("false")),
+                ("JOB_ID", Some("job-1")),
+                ("STAGE_ID", Some("stage-1")),
+            ]);
+            assert!(ParentCiContext::from_env().is_none());
+        }
+        {
+            let _guard = ScopedEnvGuard::set(&[
+                ("ACTION_RUNNER", Some("true")),
+                ("JOB_ID", Some("   ")),
+                ("STAGE_ID", Some("stage-1")),
+            ]);
+            assert!(ParentCiContext::from_env().is_none());
+        }
+        {
+            let _guard = ScopedEnvGuard::set(&[
+                ("ACTION_RUNNER", Some("true")),
+                ("JOB_ID", Some("job-1")),
+                ("STAGE_ID", None),
+            ]);
+            assert!(ParentCiContext::from_env().is_none());
+        }
+
+        // Active parent CI context with valid TRACEPARENT
+        let parent_tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        {
+            let _guard = ScopedEnvGuard::set(&[
+                ("ACTION_RUNNER", Some("true")),
+                ("ACTION_RUNNER_NODE_ID", Some("node-a")),
+                ("JOB_ID", Some("job-parent-100")),
+                ("STAGE_ID", Some("test-check")),
+                ("TASK_ID", Some("test-task")),
+                ("TRACEPARENT", Some(parent_tp)),
+                ("GITHUB_REPOSITORY", Some("LMA1980/mu-ci-worker")),
+                ("GITHUB_SHA", Some("deadbeefcafebabe")),
+            ]);
+            let ctx = ParentCiContext::from_env().expect("parent CI context must be detected");
+            assert_eq!(ctx.job_id, "job-parent-100");
+            assert_eq!(ctx.stage_id, "test-check");
+            assert_eq!(ctx.task_id.as_deref(), Some("test-task"));
+            assert_eq!(ctx.node_id.as_deref(), Some("node-a"));
+            assert_eq!(ctx.repo_name.as_deref(), Some("LMA1980/mu-ci-worker"));
+            assert_eq!(ctx.commit_sha.as_deref(), Some("deadbeefcafebabe"));
+            assert_eq!(
+                ctx.trace_id.as_deref(),
+                Some("4bf92f3577b34da6a3ce929d0e0e4736")
+            );
+            assert_eq!(ctx.stage_span_id.as_deref(), Some("00f067aa0ba902b7"));
+        }
+    }
+
+    #[test]
+    fn test_parent_ci_context_enriches_spans_logs_tests_and_benchmarks() {
+        let parent = ParentCiContext {
+            job_id: "job-parent-92".to_string(),
+            stage_id: "test-check".to_string(),
+            task_id: Some("test-task".to_string()),
+            node_id: Some("node-a".to_string()),
+            repo_name: Some("LMA1980/mu-ci-worker".to_string()),
+            commit_sha: Some("1111222233334444".to_string()),
+            trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
+            stage_span_id: Some("00f067aa0ba902b7".to_string()),
+        };
+
+        let root_child_span = OtelSpanEntry {
+            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            span_id: "1111111111111111".to_string(),
+            parent_span_id: None,
+            service_name: "mu-ci-worker".to_string(),
+            node_id: "test-node-m3".to_string(),
+            span_name: "ci.stage.s1".to_string(),
+            span_kind: "INTERNAL".to_string(),
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            end_time_unix_nano: 1_700_000_000_100_000_000,
+            duration_ns: 100_000_000,
+            status_code: "OK".to_string(),
+            status_message: None,
+            attributes_json: serde_json::json!({
+                "job_id": "j1",
+                "stage_id": "s1",
+                "repo_name": "owner/test-repo",
+                "exit_code": 0
+            })
+            .to_string(),
+        };
+        let nested_child_span = OtelSpanEntry {
+            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            span_id: "2222222222222222".to_string(),
+            parent_span_id: Some("1111111111111111".to_string()),
+            service_name: "mu-ci-worker".to_string(),
+            node_id: "node-a".to_string(),
+            span_name: "ci.tool.cargo-test".to_string(),
+            span_kind: "INTERNAL".to_string(),
+            start_time_unix_nano: 1_700_000_000_010_000_000,
+            end_time_unix_nano: 1_700_000_000_090_000_000,
+            duration_ns: 80_000_000,
+            status_code: "OK".to_string(),
+            status_message: None,
+            attributes_json: serde_json::json!({
+                "job_id": "j1",
+                "stage_id": "s1",
+                "repo_name": "owner/test-repo",
+            })
+            .to_string(),
+        };
+
+        let enriched_spans = parent.enrich_spans(&[root_child_span, nested_child_span]);
+        assert_eq!(enriched_spans.len(), 2);
+
+        // Root child span links under parent stage span; internal child span keeps its parent edge
+        assert_eq!(
+            enriched_spans[0].trace_id,
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(
+            enriched_spans[0].parent_span_id.as_deref(),
+            Some("00f067aa0ba902b7")
+        );
+        assert_eq!(enriched_spans[0].node_id, "node-a");
+
+        assert_eq!(
+            enriched_spans[1].trace_id,
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(
+            enriched_spans[1].parent_span_id.as_deref(),
+            Some("1111111111111111")
+        );
+        assert_eq!(enriched_spans[1].node_id, "node-a");
+
+        let root_attrs: serde_json::Value =
+            serde_json::from_str(&enriched_spans[0].attributes_json).expect("valid span attrs");
+        assert_eq!(
+            root_attrs["execution_context"].as_str(),
+            Some("ci_stage_child")
+        );
+        assert_eq!(root_attrs["parent_job_id"].as_str(), Some("job-parent-92"));
+        assert_eq!(root_attrs["parent_stage_id"].as_str(), Some("test-check"));
+        assert_eq!(root_attrs["parent_task_id"].as_str(), Some("test-task"));
+        assert_eq!(
+            root_attrs["parent_repo_name"].as_str(),
+            Some("LMA1980/mu-ci-worker")
+        );
+        assert_eq!(
+            root_attrs["parent_commit_sha"].as_str(),
+            Some("1111222233334444")
+        );
+        assert_eq!(
+            root_attrs["parent_trace_id"].as_str(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        assert_eq!(
+            root_attrs["parent_stage_span_id"].as_str(),
+            Some("00f067aa0ba902b7")
+        );
+        assert_eq!(root_attrs["fixture_node_id"].as_str(), Some("test-node-m3"));
+        assert_eq!(root_attrs["fixture_job_id"].as_str(), Some("j1"));
+        assert_eq!(root_attrs["fixture_stage_id"].as_str(), Some("s1"));
+        assert_eq!(
+            root_attrs["fixture_repo_name"].as_str(),
+            Some("owner/test-repo")
+        );
+
+        let nested_attrs: serde_json::Value =
+            serde_json::from_str(&enriched_spans[1].attributes_json).expect("valid nested attrs");
+        assert!(
+            nested_attrs.get("fixture_node_id").is_none(),
+            "matching host node_id should not emit fixture_node_id"
+        );
+
+        // Log enrichment
+        let child_log = OtelLogEntry {
+            timestamp_unix_nano: 1_700_000_000_020_000_000,
+            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            span_id: "1111111111111111".to_string(),
+            severity_number: 9,
+            severity_text: "INFO".to_string(),
+            service_name: "mu-ci-worker".to_string(),
+            node_id: "worker-n100-test".to_string(),
+            body: "fixture log output".to_string(),
+            attributes_json: serde_json::json!({
+                "stream": "stderr",
+                "line_no": 1,
+                "repo_name": "owner/test-repo"
+            })
+            .to_string(),
+            job_id: Some("j1".to_string()),
+            stage_id: Some("s1".to_string()),
+        };
+        let enriched_logs = parent.enrich_logs(&[child_log]);
+        assert_eq!(enriched_logs.len(), 1);
+        assert_eq!(
+            enriched_logs[0].trace_id,
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(enriched_logs[0].span_id, "1111111111111111");
+        assert_eq!(enriched_logs[0].node_id, "node-a");
+        assert_eq!(enriched_logs[0].job_id.as_deref(), Some("job-parent-92"));
+        assert_eq!(enriched_logs[0].stage_id.as_deref(), Some("test-check"));
+        let log_attrs: serde_json::Value =
+            serde_json::from_str(&enriched_logs[0].attributes_json).expect("valid log attrs");
+        assert_eq!(
+            log_attrs["execution_context"].as_str(),
+            Some("ci_stage_child")
+        );
+        assert_eq!(
+            log_attrs["fixture_node_id"].as_str(),
+            Some("worker-n100-test")
+        );
+        assert_eq!(log_attrs["fixture_job_id"].as_str(), Some("j1"));
+        assert_eq!(log_attrs["fixture_stage_id"].as_str(), Some("s1"));
+        assert_eq!(
+            log_attrs["fixture_repo_name"].as_str(),
+            Some("owner/test-repo")
+        );
+        assert_eq!(log_attrs["parent_job_id"].as_str(), Some("job-parent-92"));
+        assert_eq!(log_attrs["parent_stage_id"].as_str(), Some("test-check"));
+
+        // Test & Benchmark batch attribution
+        let test_entry = TestCaseRunEntry {
+            job_id: "j1".to_string(),
+            repo_key: "owner/test-repo".to_string(),
+            branch_key: "main".to_string(),
+            commit_sha: "fixture-sha".to_string(),
+            crate_name: "test-repo".to_string(),
+            test_binary: "cargo-test".to_string(),
+            test_name: "tests::simulated_failure".to_string(),
+            status: "failed".to_string(),
+            duration_ms: 12.0,
+            failure_summary: Some("simulated".to_string()),
+            timestamp_unix_nano: 1_700_000_000_000_000_000,
+            node_id: "test-worker".to_string(),
+            arch: "riscv64".to_string(),
+        };
+        let enriched_tests = parent.enrich_test_runs(&[test_entry]);
+        assert_eq!(enriched_tests[0].job_id, "job-parent-92");
+        assert_eq!(enriched_tests[0].repo_key, "lma1980/mu-ci-worker");
+        assert_eq!(enriched_tests[0].commit_sha, "1111222233334444");
+        assert_eq!(enriched_tests[0].node_id, "node-a");
+
+        let bench_entry = BenchmarkRunEntry {
+            job_id: "j1".to_string(),
+            repo_key: "owner/test-repo".to_string(),
+            branch_key: "main".to_string(),
+            commit_sha: "fixture-sha".to_string(),
+            crate_name: "test-repo".to_string(),
+            bench_name: "bench_fixture".to_string(),
+            ns_per_iter: 100.0,
+            std_dev_ns: 2.0,
+            mad_ns: 2.0,
+            p50_ns: 100.0,
+            p95_ns: 102.0,
+            p99_ns: 104.0,
+            throughput_value: None,
+            throughput_unit: None,
+            arch: "riscv64".to_string(),
+            cpu_cluster: "X100".to_string(),
+            vlen_bits: 256,
+            timestamp_unix_nano: 1_700_000_000_000_000_000,
+            node_id: "bench-node-worker".to_string(),
+        };
+        let enriched_benches = parent.enrich_benchmark_runs(&[bench_entry]);
+        assert_eq!(enriched_benches[0].job_id, "job-parent-92");
+        assert_eq!(enriched_benches[0].repo_key, "lma1980/mu-ci-worker");
+        assert_eq!(enriched_benches[0].commit_sha, "1111222233334444");
+        assert_eq!(enriched_benches[0].node_id, "node-a");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_telemetry_emitter_from_env_vs_new_mock_collector_integration() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("local addr").to_string();
+
+        let server_handle = tokio::spawn(async move {
+            let mut batches = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut received = Vec::new();
+                while let Ok((hdr, payload)) = read_frame(&mut stream).await {
+                    received.push((hdr, payload));
+                }
+                batches.push(received);
+            }
+            batches
+        });
+
+        let raw_span = OtelSpanEntry {
+            trace_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            span_id: "3333333333333333".to_string(),
+            parent_span_id: None,
+            service_name: "mu-ci-worker".to_string(),
+            node_id: "test-worker".to_string(),
+            span_name: "ci.stage.s1".to_string(),
+            span_kind: "INTERNAL".to_string(),
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            end_time_unix_nano: 1_700_000_000_050_000_000,
+            duration_ns: 50_000_000,
+            status_code: "OK".to_string(),
+            status_message: None,
+            attributes_json: serde_json::json!({
+                "job_id": "j1",
+                "stage_id": "s1",
+                "repo_name": "owner/test-repo"
+            })
+            .to_string(),
+        };
+        let raw_log = OtelLogEntry {
+            timestamp_unix_nano: 1_700_000_000_010_000_000,
+            trace_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            span_id: "3333333333333333".to_string(),
+            severity_number: 9,
+            severity_text: "INFO".to_string(),
+            service_name: "mu-ci-worker".to_string(),
+            node_id: "test-worker".to_string(),
+            body: "child stage log".to_string(),
+            attributes_json: serde_json::json!({"stream": "stdout", "line_no": 1}).to_string(),
+            job_id: Some("j1".to_string()),
+            stage_id: Some("s1".to_string()),
+        };
+        let raw_test = TestCaseRunEntry {
+            job_id: "j1".to_string(),
+            repo_key: "owner/test-repo".to_string(),
+            branch_key: "main".to_string(),
+            commit_sha: "fixture-sha".to_string(),
+            crate_name: "test-repo".to_string(),
+            test_binary: "cargo-test".to_string(),
+            test_name: "test_child".to_string(),
+            status: "ok".to_string(),
+            duration_ms: 1.0,
+            failure_summary: None,
+            timestamp_unix_nano: 1_700_000_000_000_000_000,
+            node_id: "test-worker".to_string(),
+            arch: "x86_64".to_string(),
+        };
+        let raw_bench = BenchmarkRunEntry {
+            job_id: "j1".to_string(),
+            repo_key: "owner/test-repo".to_string(),
+            branch_key: "main".to_string(),
+            commit_sha: "fixture-sha".to_string(),
+            crate_name: "test-repo".to_string(),
+            bench_name: "bench_child".to_string(),
+            ns_per_iter: 25.0,
+            std_dev_ns: 1.0,
+            mad_ns: 1.0,
+            p50_ns: 25.0,
+            p95_ns: 26.0,
+            p99_ns: 27.0,
+            throughput_value: None,
+            throughput_unit: None,
+            arch: "x86_64".to_string(),
+            cpu_cluster: "generic".to_string(),
+            vlen_bits: 0,
+            timestamp_unix_nano: 1_700_000_000_000_000_000,
+            node_id: "bench-node-worker".to_string(),
+        };
+
+        let (env_emitter, direct_emitter) = {
+            let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = ScopedEnvGuard::set(&[
+                ("MUOBSERVE_COLLECTOR_ADDR", Some(&addr)),
+                ("ACTION_RUNNER", Some("true")),
+                ("ACTION_RUNNER_NODE_ID", Some("worker-riscv64")),
+                ("JOB_ID", Some("job-ci-92")),
+                ("STAGE_ID", Some("test-check")),
+                ("TASK_ID", Some("test-task")),
+                (
+                    "TRACEPARENT",
+                    Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+                ),
+                ("GITHUB_REPOSITORY", Some("LMA1980/mu-ci-worker")),
+                ("GITHUB_SHA", Some("feedface12345678")),
+            ]);
+            (TelemetryEmitter::from_env(), TelemetryEmitter::new(&addr))
+        };
+
+        assert!(env_emitter.parent_context().is_some());
+        assert!(direct_emitter.parent_context().is_none());
+
+        // 1. TelemetryEmitter::from_env() enriches all 4 batch types
+        let sent_env = env_emitter
+            .emit_stage_bundle(
+                std::slice::from_ref(&raw_span),
+                std::slice::from_ref(&raw_log),
+                std::slice::from_ref(&raw_test),
+                std::slice::from_ref(&raw_bench),
+            )
+            .await
+            .expect("emit env bundle");
+        assert_eq!(sent_env, 4);
+
+        // 2. TelemetryEmitter::new(addr) preserves raw standalone behavior even under same env
+        let sent_direct = direct_emitter
+            .emit_stage_bundle(
+                std::slice::from_ref(&raw_span),
+                std::slice::from_ref(&raw_log),
+                std::slice::from_ref(&raw_test),
+                std::slice::from_ref(&raw_bench),
+            )
+            .await
+            .expect("emit direct bundle");
+        assert_eq!(sent_direct, 4);
+
+        let batches = server_handle.await.expect("join mock collector");
+        assert_eq!(batches.len(), 2);
+
+        // Validate enriched batch (from_env)
+        let env_spans = decode_span_batch(&batches[0][0].1).expect("decode env spans");
+        assert_eq!(env_spans[0].trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(
+            env_spans[0].parent_span_id.as_deref(),
+            Some("00f067aa0ba902b7")
+        );
+        assert_eq!(env_spans[0].node_id, "worker-riscv64");
+        let env_span_attrs: serde_json::Value =
+            serde_json::from_str(&env_spans[0].attributes_json).unwrap();
+        assert_eq!(
+            env_span_attrs["execution_context"].as_str(),
+            Some("ci_stage_child")
+        );
+        assert_eq!(
+            env_span_attrs["fixture_node_id"].as_str(),
+            Some("test-worker")
+        );
+        assert_eq!(
+            env_span_attrs["fixture_repo_name"].as_str(),
+            Some("owner/test-repo")
+        );
+
+        let env_logs = decode_log_batch(&batches[0][1].1).expect("decode env logs");
+        assert_eq!(env_logs[0].node_id, "worker-riscv64");
+        assert_eq!(env_logs[0].job_id.as_deref(), Some("job-ci-92"));
+        assert_eq!(env_logs[0].stage_id.as_deref(), Some("test-check"));
+
+        let env_tests = decode_test_run_batch(&batches[0][2].1).expect("decode env tests");
+        assert_eq!(env_tests[0].job_id, "job-ci-92");
+        assert_eq!(env_tests[0].repo_key, "lma1980/mu-ci-worker");
+        assert_eq!(env_tests[0].commit_sha, "feedface12345678");
+        assert_eq!(env_tests[0].node_id, "worker-riscv64");
+
+        let env_benches = decode_benchmark_run_batch(&batches[0][3].1).expect("decode env benches");
+        assert_eq!(env_benches[0].job_id, "job-ci-92");
+        assert_eq!(env_benches[0].repo_key, "lma1980/mu-ci-worker");
+        assert_eq!(env_benches[0].commit_sha, "feedface12345678");
+        assert_eq!(env_benches[0].node_id, "worker-riscv64");
+
+        // Validate standalone batch (new)
+        let direct_spans = decode_span_batch(&batches[1][0].1).expect("decode direct spans");
+        assert_eq!(direct_spans, vec![raw_span]);
+        let direct_logs = decode_log_batch(&batches[1][1].1).expect("decode direct logs");
+        assert_eq!(direct_logs, vec![raw_log]);
+        let direct_tests = decode_test_run_batch(&batches[1][2].1).expect("decode direct tests");
+        assert_eq!(direct_tests, vec![raw_test]);
+        let direct_benches =
+            decode_benchmark_run_batch(&batches[1][3].1).expect("decode direct benches");
+        assert_eq!(direct_benches, vec![raw_bench]);
     }
 }

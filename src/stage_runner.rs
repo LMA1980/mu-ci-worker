@@ -1414,20 +1414,7 @@ impl StageRunner {
             cmd.process_group(0);
 
             // Environment Setup
-            cmd.env("CI", "true");
-            cmd.env("MU_CI", "true");
-            cmd.env("ACTION_RUNNER", "true");
-            cmd.env("JOB_ID", &task.job_id);
-            cmd.env("STAGE_ID", &task.stage_id);
-            cmd.env("TASK_ID", &inv.task_id);
-            cmd.env("TRACEPARENT", trace_session.child_traceparent());
-            cmd.env("GITHUB_REPOSITORY", &task.repo_name);
-            cmd.env("GITHUB_SHA", &task.commit_sha);
-            cmd.env("CARGO_BUILD_JOBS", build_jobs.to_string());
-            cmd.env("RUST_TEST_THREADS", build_jobs.to_string());
-            cmd.env("RAYON_NUM_THREADS", build_jobs.to_string());
-            cmd.env("CMAKE_BUILD_PARALLEL_LEVEL", build_jobs.to_string());
-            cmd.env("CARGO_TERM_COLOR", "always");
+            self.apply_stage_base_env(&mut cmd, task, inv, &trace_session, build_jobs);
 
             self.apply_toolchain_env(&mut cmd, task);
 
@@ -1544,6 +1531,31 @@ impl StageRunner {
             test_case_runs: all_test_runs,
             benchmark_runs: all_bench_runs,
         }
+    }
+
+    fn apply_stage_base_env(
+        &self,
+        cmd: &mut Command,
+        task: &StageDispatchTask,
+        inv: &TypedTaskInvocation,
+        trace_session: &StageTraceSession,
+        build_jobs: u32,
+    ) {
+        cmd.env("CI", "true");
+        cmd.env("MU_CI", "true");
+        cmd.env("ACTION_RUNNER", "true");
+        cmd.env("ACTION_RUNNER_NODE_ID", &self.config.node_id);
+        cmd.env("JOB_ID", &task.job_id);
+        cmd.env("STAGE_ID", &task.stage_id);
+        cmd.env("TASK_ID", &inv.task_id);
+        cmd.env("TRACEPARENT", trace_session.child_traceparent());
+        cmd.env("GITHUB_REPOSITORY", &task.repo_name);
+        cmd.env("GITHUB_SHA", &task.commit_sha);
+        cmd.env("CARGO_BUILD_JOBS", build_jobs.to_string());
+        cmd.env("RUST_TEST_THREADS", build_jobs.to_string());
+        cmd.env("RAYON_NUM_THREADS", build_jobs.to_string());
+        cmd.env("CMAKE_BUILD_PARALLEL_LEVEL", build_jobs.to_string());
+        cmd.env("CARGO_TERM_COLOR", "always");
     }
 
     fn compute_toolchain_env(
@@ -4134,6 +4146,105 @@ mod multi_arch_toolchain_tests {
                 .get("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
                 .map(String::as_str),
             Some("-C target-cpu=cortex-a72")
+        );
+    }
+
+    #[test]
+    fn test_apply_stage_base_env_exports_action_runner_node_id_and_w3c_context() {
+        let dir = tempdir().unwrap();
+        let cfg = WorkerConfig {
+            controller_url: "ws://127.0.0.1:8000/api/cluster/tunnel".into(),
+            cluster_token: "test".into(),
+            node_id: "worker-riscv64".into(),
+            arch: "riscv64".into(),
+            tags: vec!["k3".into(), "x100".into()],
+            max_slots: 1,
+            workspace_dir: dir.path().to_path_buf(),
+            toolchains: vec!["system".into()],
+            use_btrfs: false,
+            isolation_mode: IsolationMode::None,
+            rust_semver: None,
+        };
+        let runner = StageRunner::new(cfg);
+
+        let parent_tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let inv = TypedTaskInvocation {
+            task_id: "task-unit-tests".into(),
+            tool_name: "cargo-test".into(),
+            args: vec!["--workspace".into()],
+            working_dir: None,
+            env_vars: vec![],
+            sandbox: mu_ci_ipc::SandboxConstraintSpec::default(),
+            sccache_mode: Default::default(),
+        };
+        let task = StageDispatchTask {
+            job_id: "job-parent-92".into(),
+            stage_id: "stage-test-92".into(),
+            stage_name: "Test".into(),
+            repo_name: "LMA1980/mu-ci-worker".into(),
+            clone_url: "".into(),
+            commit_sha: "abc1234def5678".into(),
+            command: "".into(),
+            working_dir: None,
+            env_vars: vec![],
+            timeout_seconds: 60,
+            threads: 4,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+            tasks: vec![inv.clone()],
+            sandbox_constraints: mu_ci_ipc::SandboxConstraintSpec::default(),
+            traceparent: Some(parent_tp.to_string()),
+            sccache_mode: Default::default(),
+        };
+        let hw = HardwareProfile::detect(&runner.config, &task, Some(&inv));
+        let trace_session =
+            StageTraceSession::from_dispatch_task(&task, &runner.config.node_id, &hw);
+
+        let mut cmd = Command::new("cargo");
+        runner.apply_stage_base_env(&mut cmd, &task, &inv, &trace_session, 4);
+
+        let envs: std::collections::HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+
+        assert_eq!(envs.get("CI").map(String::as_str), Some("true"));
+        assert_eq!(envs.get("MU_CI").map(String::as_str), Some("true"));
+        assert_eq!(envs.get("ACTION_RUNNER").map(String::as_str), Some("true"));
+        assert_eq!(
+            envs.get("ACTION_RUNNER_NODE_ID").map(String::as_str),
+            Some("worker-riscv64")
+        );
+        assert_eq!(
+            envs.get("JOB_ID").map(String::as_str),
+            Some("job-parent-92")
+        );
+        assert_eq!(
+            envs.get("STAGE_ID").map(String::as_str),
+            Some("stage-test-92")
+        );
+        assert_eq!(
+            envs.get("TASK_ID").map(String::as_str),
+            Some("task-unit-tests")
+        );
+        assert_eq!(
+            envs.get("TRACEPARENT").map(String::as_str),
+            Some(trace_session.child_traceparent().as_str())
+        );
+        assert_eq!(
+            envs.get("GITHUB_REPOSITORY").map(String::as_str),
+            Some("LMA1980/mu-ci-worker")
+        );
+        assert_eq!(
+            envs.get("GITHUB_SHA").map(String::as_str),
+            Some("abc1234def5678")
         );
     }
 }
